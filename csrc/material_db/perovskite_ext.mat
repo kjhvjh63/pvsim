@@ -1,0 +1,24 @@
+# 钙钛矿体系扩展材料（过渡值）
+#
+# 与 python/pvsim/param/schema.py 的 mapbi3_stack() 保持一致，
+# 等实验/文献标定后再逐项替换；格式与 silvaco.mat 相同。
+
+material name=MAPBI3
+  permittivity=24.0 eg300=1.6 chi3=3.93 \
+  nc300=2.2e18 nv300=1.0e19 mun=1.6 mup=1.7 taun0=8e-9 taup0=8e-9
+
+material name=SPIRO
+  permittivity=3.0 eg300=3.0 chi3=2.5 \
+  nc300=5e19 nv300=5e19 mun=0.01 mup=0.02
+
+material name=C60
+  permittivity=4.0 eg300=1.8 chi3=4.0 \
+  nc300=1e18 nv300=1e18 mun=1.0 mup=1.0
+
+material name=NIO
+  permittivity=11.9 eg300=3.6 chi3=1.8 \
+  nc300=1e19 nv300=1e19 mun=0.1 mup=0.1
+
+material name=SNO2
+  permittivity=9.0 eg300=3.6 chi3=4.0 \
+  nc300=1e20 nv300=1e20 mun=10 mup=1

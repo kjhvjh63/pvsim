@@ -1,0 +1,35 @@
+# Silvaco 通用材料库（子集）
+#
+# 这里只放了 pvsim 目前用得到的条目，数值为 300 K 常用近似值。
+# 正式对标时应替换为 Silvaco 原始 .mat 文件（格式兼容，可直接覆盖本文件）。
+#
+# 支持键：permittivity(=eps)、eg300(=eg)、chi3(=chi)、nc300/nv300、
+#         mun、mup、taun0/taup0；其余键保留在 extra 中不参与计算。
+
+material name=SI
+  permittivity=11.7 eg300=1.12 chi3=4.05 \
+  nc300=2.8e19 nv300=1.04e19 mun=1400 mup=450
+
+material name=GAAS
+  permittivity=12.9 eg300=1.42 chi3=4.07 \
+  nc300=4.7e17 nv300=7.0e18 mun=8500 mup=400
+
+material name=TIO2
+  permittivity=10.0 eg300=3.2 chi3=4.0 \
+  nc300=5e20 nv300=5e20 mun=0.1 mup=0.01
+
+material name=FTO
+  permittivity=9.0 eg300=3.7 chi3=4.2 \
+  nc300=1e21 nv300=1e21 mun=20 mup=10
+
+material name=ITO
+  permittivity=9.0 eg300=3.6 chi3=4.3 \
+  nc300=1e21 nv300=1e21 mun=30 mup=10
+
+material name=AU
+  permittivity=1.0 eg300=1.0 chi3=4.7 \
+  nc300=1e22 nv300=1e22 mun=100 mup=80
+
+material name=AG
+  permittivity=1.0 eg300=1.0 chi3=4.3 \
+  nc300=1e22 nv300=1e22 mun=100 mup=80
