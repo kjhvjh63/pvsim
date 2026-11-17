@@ -25,11 +25,12 @@ typedef struct {
 
     /* ── 网格签名 ──
      * solve_dc 每次都调 build_mesh 会把网格和 field 缓存全部重建，从而
-     * 丢掉上一次的解（warm start）。用这三个值判断 device 是否变化，
+     * 丢掉上一次的解（warm start）。用这几个值判断 device 是否变化，
      * 没变就跳过重建。 */
     int          sig_valid;
     int          sig_n_layers;
     int          sig_nodes;
+    double       sig_refine;
     double       sig_total_nm;
 } pvk_mesh;
 
