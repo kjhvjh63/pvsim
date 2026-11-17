@@ -100,6 +100,10 @@ typedef struct {
     double* hc;         /* 控制体宽度 */
     int*    bc;         /* 0=求解, 1=阴极型 Dirichlet, 2=阳极型 Dirichlet */
     int     eq_minority;/* 1 = 少数载流子退化时用 φ_min=φ_maj 兜底 */
+    /* 接触层（隐式）：0=正常, 1=阴极侧接触层, 2=阳极侧接触层。
+     * 这些节点的连续性行换成 φn/φp = 接触值（欧姆接触的无限复合），
+     * Poisson 仍求解。用于接触积累层远细于网格的情形（见 mark_contact_layer）。 */
+    unsigned char* cpl;
 
     double  u_bc[2];
     double  wn_bc[2];
@@ -141,17 +145,18 @@ static void node_dens(const pvk_model* m, int i, const double* u,
     *pout = m->Nv[i] * exp(ep);
 }
 
-/* 连续方程的相对残差：|不平衡| / max(|散度|, |源项|)。
- * 即 |通量散度-源项| / 全器件源项尺度 smax：量纲一、跨层可比，且不会被
- * "两项都接近 0" 的节点放大。图中峰值源项 G 决定 smax。
- * 旧实现除以当地载流子密度 n（异质结两侧差 40 个数量级），得到的量
- * 既不是无量纲量，又让 2-范数被 n≈1e-40 的节点支配 —— Newton 早已停在
- * 相对误差 1e-4 的地方，却因为“步长不动”被判成收敛。 */
-static double rel_cont(double num, double smax) {
-    if (!(smax > 0.0)) return 0.0;
-    double v = fabs(num) / smax;
-    if (!isfinite(v)) return 1e6;
-    return v > 1e6 ? 1e6 : v;
+/* 连续方程行的归一尺度：max(全器件源项尺度, 当地通量/hc)。
+ *
+ * 只除以当地载流子密度 n 时，接触积累层/异质结附近 n 可达 1e16–1e20，
+ * SG 通量（~n·Vt/h）的 double 舍入噪声折算成相对残差就是 O(1)–O(10)，
+ * Newton 永远压不下去（暗态 refine>0 停在 rel≈0.15 的根因）。改用
+ * “电流守恒”的相对量纲：|div J - src| 与 |J|/hc 比较，舍入噪声只有
+ * ~1e-10，物理不平衡仍是 O(1)。缩放因子恒正，不改变方程的根。 */
+static double cont_scale(double jR, double jL, double hc, double smax) {
+    double s = fmax(fabs(jR), fabs(jL)) / hc;
+    if (smax > s) s = smax;
+    if (!(s > 0.0) || !isfinite(s)) return 1.0;
+    return s;
 }
 
 /* 累积相对残差：平方和 + 计数，最后取 RMS；同时记录峰值位置 */
@@ -201,14 +206,13 @@ static double residual(const pvk_model* m, const double* u, double* r,
     int    reli = -1, relkind = -1;
 
     /* 全器件源项尺度：用来把"两边都接近 0、纯数值噪声"的行排除在
-     * 相对残差之外（禁带很宽的传输层里 ni/τeff 小到没有意义）。 */
+     * 相对残差之外（禁带很宽的传输层里 ni/τeff 小到没有意义）。
+     * 下面连续方程按 max(smax, 当地通量/hc) 归一，所以每次调用都要算。 */
     double smax = 0.0;
-    if (rel_out) {
-        for (int i = 0; i < n; i++) {
-            double t = 1.0 / (1.0 / m->taun[i] + 1.0 / m->taup[i]);
-            double s = fabs(m->G[i]) + m->ni[i] / t;
-            if (s > smax) smax = s;
-        }
+    for (int i = 0; i < n; i++) {
+        double t = 1.0 / (1.0 / m->taun[i] + 1.0 / m->taup[i]);
+        double s = fabs(m->G[i]) + m->ni[i] / t;
+        if (s > smax) smax = s;
     }
 
     /* 界面相邻节点（紧邻接触的那两个自由节点）的连续性行不参与判据：
@@ -217,8 +221,8 @@ static double residual(const pvk_model* m, const double* u, double* r,
      * （实测 101→397：1.3e-3→6.1e-2），但不代表体内方程没解到位。 */
     int first_free = -1, last_free = -1;
     if (rel_out) {
-        for (int i = 0; i < n; i++) if (!m->bc[i]) { first_free = i; break; }
-        for (int i = n - 1; i >= 0; i--) if (!m->bc[i]) { last_free = i; break; }
+        for (int i = 0; i < n; i++) if (!m->bc[i] && !m->cpl[i]) { first_free = i; break; }
+        for (int i = n - 1; i >= 0; i--) if (!m->bc[i] && !m->cpl[i]) { last_free = i; break; }
     }
 
     for (int i = 0; i < n; i++) {
@@ -253,7 +257,12 @@ static double residual(const pvk_model* m, const double* u, double* r,
             double a = fabs(r[i]) / den;
             if (a > rmax) rmax = a;
             rsum2 += a * a;
-            REL_ACC_K(a, 0);
+            /* 收敛判据用的相对残差下限取 1e10 cm⁻³：界面附近 n、p 都
+             * 极小（1e-17 / 1e5 量级）时，绝对残差 ~1e4 cm⁻³ 只是离散
+             * 误差的噪声，却会让 |r|/max(|f|,|c|) 停在 1e-2 以上，把
+             * 已经解到位的解判成未收敛。 */
+            { double denm = den < 1e10 ? 1e10 : den;
+              REL_ACC_K(fabs(r[i]) / denm, 0); }
         }
 
         /* ---- 电子连续 ----
@@ -292,6 +301,25 @@ static double residual(const pvk_model* m, const double* u, double* r,
         double jpL = m->mup[i] * m->Vt / hL *
                      (pbuf[i-1] * bern(dpL) - pbuf[i] * bern(-dpL));
 
+        /* ---- 接触层隐式处理 ----
+         * 电极旁的积累层德拜长度可到 0.1 nm，网格（哪怕 refine=2 的
+         * 0.4 nm）解析不了。与其让连续性方程去追这个边界层（通量
+         * 噪声把相对残差抬到 O(1)，Newton 永远停不下来），不如把这一层
+         * 归入接触：φn/φp 钉在电极费米能级上（无限表面复合，欧姆接触），
+         * 载流子密度仍由 Poisson 与 ψ 自洽给出。Poisson 行保留。 */
+        if (m->cpl[i]) {
+            int e = m->cpl[i] - 1;
+            r[n + i]     = u[n + i]     - m->wn_bc[e];
+            r[2 * n + i] = u[2*n + i]   - m->wp_bc[e];
+            double sc = fabs(r[n+i]);
+            if (fabs(r[2*n+i]) > sc) sc = fabs(r[2*n+i]);
+            if (sc > rmax) rmax = sc;
+            rsum2 += r[n+i]*r[n+i] + r[2*n+i]*r[2*n+i];
+            REL_ACC_K(r[n + i], 9);
+            REL_ACC_K(r[2*n + i], 10);
+            continue;
+        }
+
         if (m->eq_minority) {
             /* 少数载流子退化时换成 φn=φp。两种触发条件：
              *  - 相对：比另一种低 6 个数量级以上；
@@ -310,23 +338,27 @@ static double residual(const pvk_model* m, const double* u, double* r,
             if (!e_deg) {
                 double den = nbuf[i] > 1e-280 ? nbuf[i] : 1e-280;
                 r[n + i] = ((jnR - jnL) / hc - src) / den;
-                { double rc = rel_cont((jnR - jnL) / hc - src, smax);
+                { double rc = fabs((jnR - jnL) / hc - src)
+                                  / cont_scale(jnR, jnL, hc, smax);
                   if (!iface_row) REL_ACC_K(rc, 1); }
             }
             if (!p_deg) {
                 double den = pbuf[i] > 1e-280 ? pbuf[i] : 1e-280;
                 r[2 * n + i] = ((jpR - jpL) / hc + src) / den;
-                { double rc = rel_cont((jpR - jpL) / hc + src, smax);
+                { double rc = fabs((jpR - jpL) / hc + src)
+                                  / cont_scale(jpR, jpL, hc, smax);
                   if (!iface_row) REL_ACC_K(rc, 2); }
             }
         } else {
             double den_n = nbuf[i] > 1e-280 ? nbuf[i] : 1e-280;
             r[n + i] = ((jnR - jnL) / hc - src) / den_n;
-            { double rc = rel_cont((jnR - jnL) / hc - src, smax);
+            { double rc = fabs((jnR - jnL) / hc - src)
+                              / cont_scale(jnR, jnL, hc, smax);
               if (!iface_row) REL_ACC_K(rc, 1); }
             double den_p = pbuf[i] > 1e-280 ? pbuf[i] : 1e-280;
             r[2 * n + i] = ((jpR - jpL) / hc + src) / den_p;
-            { double rc = rel_cont((jpR - jpL) / hc + src, smax);
+            { double rc = fabs((jpR - jpL) / hc + src)
+                              / cont_scale(jpR, jpL, hc, smax);
               if (!iface_row) REL_ACC_K(rc, 2); }
         }
 
@@ -442,6 +474,7 @@ static void model_free(pvk_model* m) {
     pvk__free(m->chis); pvk__free(m->egs);
     pvk__free(m->hc);
     pvk__free(m->bc);
+    pvk__free(m->cpl);
     memset(m, 0, sizeof(*m));
 }
 
@@ -449,6 +482,36 @@ static void model_free(pvk_model* m) {
  * 只用于平衡态求解的带边 homotopy（见 equilibrium_guess）。 */
 static double homo_lerp(double v, double ref, double t) {
     return ref + t * (v - ref);
+}
+
+/* 某一层电中性时的 ψ/Vt（不含 U_ref）。
+ * 解 A·e^z - B·e^-z = Nd - Na（A=Nc e^{χ/Vt}, B=Nv e^{-(χ+Eg)/Vt}）。
+ *
+ * 电极边界条件必须用它，而不是按“本征 / n 型 / p 型”分支套公式：
+ * homotopy 里掺杂按 homo·Nd/Na 缩放，homo→0+ 时 Na→0，p 型分支的
+ * -Vt·log(Na/Nv) 会跳到 +∞ 再掉回本征值，pin 住的接触电位在第一步
+ * 就跳 0.2 V 以上。refine>0 时接触旁的网格只有 0.1 nm，这个跳变
+ * 直接让 Poisson 的 Newton 在 it=0 线搜索失败。用统一的电中性解，
+ * 电位随 homo 连续变化。
+ *
+ * 实现上用「本征点 + asinh」：ni = sqrt(Nc·Nv)·e^{-Eg/2Vt} 常常小到
+ * 下溢（TiO2 的 Eg=3.2 eV 时 ni~1e-6），直接解二次式会丢精度，
+ * 因此在 log 空间算 rho = (Nd-Na)/(2·ni)。 */
+static double neutral_u(double Nc, double Nv, double chi, double eg,
+                        double Nd, double Na, double Vt) {
+    if (!(Nc > 0.0) || !(Nv > 0.0) || !(Vt > 0.0)) return 0.0;
+    double ln_ni = 0.5 * (log(Nc) + log(Nv)) - eg / (2.0 * Vt);
+    double u_i   = 0.5 * log(Nv / Nc) - chi / Vt - eg / (2.0 * Vt);
+    double D = Nd - Na;
+    if (D == 0.0 || !isfinite(ln_ni)) return u_i;
+
+    /* delta = asinh(rho)，rho = D/(2·ni)，在 log 空间算模长 */
+    double lrho = log(fabs(D)) - 0.6931471805599453 - ln_ni;
+    double delta;
+    if (lrho > 30.0)       delta = lrho + 0.6931471805599453;
+    else if (lrho < -30.0) delta = exp(lrho);
+    else                   delta = asinh(exp(lrho));
+    return u_i + (D > 0.0 ? delta : -delta);
 }
 
 static int model_init(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
@@ -469,52 +532,54 @@ static int model_init(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
     const pvk_layer* C = &dev->layers[0];
     const pvk_layer* A = &dev->layers[dev->n_layers - 1];
 
-    /* 带边 homotopy 的参考点：窄带隙（吸收）层的 χ/Eg。
-     * homo=1（正式求解）时下面所有插值都退化成真实参数。 */
+    /* 带边 homotopy 的参考点：全器件带隙最小的一层（含电极）。
+     * 这是历史沿用的路径：参考点带隙越窄、本征载流子越少（Au 的
+     * Eg=1.0 eV 时 ni~1e11），t=0 时器件近似“空”的，Poisson 近 Laplace，
+     * 对初值偏压最不敏感。homo=1 时所有插值退化成真实参数。
+     * 只改参考点会改变整条 homotopy 路径（exp 型 Poisson 有多解），
+     * 亮态冷启动对路径敏感，所以这里保持原样。 */
     int iref = 0;
     for (int i = 1; i < dev->n_layers; i++)
         if (dev->layers[i].Eg_eV < dev->layers[iref].Eg_eV) iref = i;
     double chi_ref = dev->layers[iref].chi_eV;
     double eg_ref  = dev->layers[iref].Eg_eV;
 
+    /* 电极层的带参数在下面会被换成相邻半导体的（理想 Ohmic 接触），
+     * 所以边界电位也必须用相邻半导体的 Nc/Nv/χ/Eg 来算，只保留电极
+     * 自己的掺杂。否则 pin 住的电位和接触节点的带参数差 ~1.5 eV
+     * （Au 4.7/1.0 vs Spiro 2.5/3.0），粗网格把这台阶摊在 16 nm 上还能
+     * 忍，interface.refine>0 时首格 0.1 nm，电场 1e8 V/cm，Poisson 的
+     * Newton 在 t≈0.4 就停滞。 */
+    int lic = 0;
+    while (lic + 1 < dev->n_layers && dev->layers[lic].is_contact) lic++;
+    int lia = dev->n_layers - 1;
+    while (lia > 0 && dev->layers[lia].is_contact) lia--;
+    const pvk_layer* Cb = &dev->layers[lic];
+    const pvk_layer* Ab = &dev->layers[lia];
+
     /* U_ref：让 x=0 处 ψ=0、φ=0 时满足阴极层的电中性。
      * homo 同时缩放掺杂：homo=0 时整个器件是本征、同一带结构，
      * 各层电中性电位全是 ψ=0（含两个电极的边界值），初值即精确解。 */
-    double chi_C = homo_lerp(C->chi_eV, chi_ref, homo);
-    double eg_C  = homo_lerp(C->Eg_eV,  eg_ref,  homo);
-    double nc_C  = C->Nc_cm3 > 0 ? C->Nc_cm3 : 1.0;
-    double nv_C  = C->Nv_cm3 > 0 ? C->Nv_cm3 : 1.0;
+    double chi_C = homo_lerp(Cb->chi_eV, chi_ref, homo);
+    double eg_C  = homo_lerp(Cb->Eg_eV,  eg_ref,  homo);
+    double nc_C  = Cb->Nc_cm3 > 0 ? Cb->Nc_cm3 : 1.0;
+    double nv_C  = Cb->Nv_cm3 > 0 ? Cb->Nv_cm3 : 1.0;
     double Nd_C  = homo * C->Nd_cm3;
     double Na_C  = homo * C->Na_cm3;
-    double ni_c  = sqrt(nc_C * nv_C) * exp(-eg_C / (2.0 * Vt));
-    if (Nd_C > 0.0 && Nd_C >= Na_C) {
-        m->U_ref = Vt * log(Nd_C / nc_C) - chi_C;
-    } else if (Na_C > 0.0) {
-        m->U_ref = -chi_C - eg_C - Vt * log(Na_C / nv_C);
-    } else {
-        m->U_ref = Vt * log(ni_c / nc_C) - chi_C;
-    }
+    double u_neu_C = neutral_u(nc_C, nv_C, chi_C, eg_C, Nd_C, Na_C, Vt);
+    m->U_ref = Vt * u_neu_C;
 
     /* 阳极 ψ 的 Dirichlet 值（电中性 + 准费米劈裂）。
      * 注意电化学势符号：阳极静电势比阴极高 V_app 时，电子的准费米势
      * 下降 q·V_app —— 所以 φ = -V_app，ψ 上则是 +V_app。 */
-    double chi_A = homo_lerp(A->chi_eV, chi_ref, homo);
-    double eg_A  = homo_lerp(A->Eg_eV,  eg_ref,  homo);
+    double chi_A = homo_lerp(Ab->chi_eV, chi_ref, homo);
+    double eg_A  = homo_lerp(Ab->Eg_eV,  eg_ref,  homo);
+    double nc_A  = Ab->Nc_cm3 > 0 ? Ab->Nc_cm3 : 1.0;
+    double nv_A  = Ab->Nv_cm3 > 0 ? Ab->Nv_cm3 : 1.0;
     double Nd_A  = homo * A->Nd_cm3;
     double Na_A  = homo * A->Na_cm3;
-    if (Na_A > 0.0 && Na_A >= Nd_A) {
-        double nv = A->Nv_cm3 > 0 ? A->Nv_cm3 : 1.0;
-        m->psi_a = -chi_A - eg_A - m->U_ref + V_app
-                   - Vt * log(Na_A / nv);
-    } else if (Nd_A > 0.0) {
-        double nc = A->Nc_cm3 > 0 ? A->Nc_cm3 : 1.0;
-        m->psi_a = Vt * log(Nd_A / nc) - chi_A - m->U_ref + V_app;
-    } else {
-        double nc = A->Nc_cm3 > 0 ? A->Nc_cm3 : 1.0;
-        double nv = A->Nv_cm3 > 0 ? A->Nv_cm3 : 1.0;
-        double ni_A = sqrt(nc * nv) * exp(-eg_A / (2.0 * Vt));
-        m->psi_a = Vt * log(ni_A / nc) - chi_A - m->U_ref + V_app;
-    }
+    double u_neu_A = neutral_u(nc_A, nv_A, chi_A, eg_A, Nd_A, Na_A, Vt);
+    m->psi_a = Vt * (u_neu_A - u_neu_C) + V_app;
 
     size_t dn = sizeof(double) * (size_t)n;
     m->eps  = (double*)pvk__malloc(dn);
@@ -534,12 +599,14 @@ static int model_init(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
     m->egs  = (double*)pvk__malloc(dn);
     m->hc   = (double*)pvk__malloc(dn);
     m->bc   = (int*)pvk__malloc(sizeof(int) * (size_t)n);
+    m->cpl  = (unsigned char*)pvk__malloc(sizeof(unsigned char) * (size_t)n);
     if (!m->eps || !m->chi || !m->Eg || !m->Nc || !m->Nv || !m->mun ||
         !m->mup || !m->taun || !m->taup || !m->Nd || !m->Na || !m->G ||
-        !m->ni || !m->chis || !m->egs || !m->hc || !m->bc) {
+        !m->ni || !m->chis || !m->egs || !m->hc || !m->bc || !m->cpl) {
         model_free(m);
         return PVK_EMEM;
     }
+    memset(m->cpl, 0, sizeof(unsigned char) * (size_t)n);
 
     const double* gopt = ctx->state.fields[PVK_FIELD_G_OPT];
 
@@ -602,6 +669,9 @@ static int model_init(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
         if (m->bc[i] == m->bc[i+1]) continue;
         int jsemi = m->bc[i] ? i + 1 : i;          /* 半导体侧节点 */
         int lcont = m->bc[i] ? m->node_layer[i] : m->node_layer[i+1];
+        if (getenv("PVK_DEBUG_MODEL"))
+            fprintf(stderr, "[pvk] copy: i=%d bc=%d/%d jsemi=%d lcont=%d chi_semi=%.3f\n",
+                    i, m->bc[i], m->bc[i+1], jsemi, lcont, m->chi[jsemi]);
         for (int k = 0; k < n; k++) {
             if (!m->bc[k] || m->node_layer[k] != lcont) continue;
             m->eps[k]  = m->eps[jsemi];
@@ -633,6 +703,20 @@ static int model_init(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
     m->wn_bc[1] = -V_app / Vt;
     m->wp_bc[0] = 0.0;
     m->wp_bc[1] = -V_app / Vt;
+
+    if (getenv("PVK_DEBUG") && getenv("PVK_DEBUG_MODEL")) {
+        fprintf(stderr, "[pvk] model homo=%g V=%g n=%d u_bc=%.4f/%.4f\n",
+                homo, V_app, n, m->u_bc[0], m->u_bc[1]);
+        for (int i = 0; i < n; i++) {
+            if (m->bc[i] || (i + 1 < n && m->bc[i+1])) {
+                fprintf(stderr,
+                        "[pvk]   node=%d layer=%d bc=%d x=%.3f chi=%.3f eg=%.3f "
+                        "Nc=%.2e Nd=%.2e\n",
+                        i, m->node_layer[i], m->bc[i], m->x[i] * 1e7,
+                        m->chi[i], m->Eg[i], m->Nc[i], m->Nd[i]);
+            }
+        }
+    }
 
     return PVK_OK;
 }
@@ -674,8 +758,15 @@ static int solve_newton(pvk_model* m, double* u,
     int converged = 0;
     int iters = 0;
     int status = PVK_OK;
+    double rel_prev = 1e300, rel_prev2 = 1e300;
+    /* 额外预算：高偏压时 2-范数收敛慢（rel 每步只降 ~11%），60 步
+     * 常常只差 1–2 步。只有当 rel<1e-2 且仍在下降（>2%/步）时才允许
+     * 用到这 20 步，避免真发散的算例白白多算。 */
+    int maxit_ext = maxit + 20;
 
-    for (int it = 0; it < maxit; it++) {
+    for (int it = 0; it < maxit_ext; it++) {
+        if (it >= maxit &&
+            !(rel_prev < 1e-2 && rel_prev < 0.98 * rel_prev2)) break;
         if (rn < tol) { converged = 1; break; }
 
         /* ---- 数值雅可比（前向差分） ---- */
@@ -733,9 +824,29 @@ static int solve_newton(pvk_model* m, double* u,
         rn = rn_new;
         iters = it + 1;
 
+        /* 物理判据提前放行：通量相对残差（局部电流守恒/泊松/边界）已经
+         * < 1e-3 时，2-范数可能仍被"按 n 或 p 归一"的少数载流子行撑在
+         * O(10–1e3)。高注入下界面处 p 很大而空穴通量更大，这一行本来就
+         * 只是噪声（绝对不平衡 < 产生率的 1e-3），再往下是 SG 在异质结
+         * 上的一阶截断误差，Newton 压不动 —— 201/refine=2 在 V>1.1
+         * 卡满 60 步就是这个原因。
+         *
+         * 必须同时要求 rn < 1e3：rel 只保证"相对当地通量"守恒，若某个
+         * 局部通量被算得极大（错误解），rel 也可以很小。加上这条，低偏压
+         * 下 rn~1e19 的病态解不会被误当成收敛（101/refine=1 的 J-V 曾
+         * 因此出现 J 符号乱跳）。 */
+        {
+            double rel_now = 0.0;
+            residual(m, u, utmp, nb2, pb2, rn2, &rel_now);
+            if (rel_now < 1e-3 && rn < 1e3) converged = 1;
+            rel_prev2 = rel_prev;
+            rel_prev = rel_now;
+            if (converged) break;
+        }
+
         /* 步长停滞后再用相对不平衡度确认，避免把"伪收敛"当收敛。
-         * 不能直接用 rel 当停止判据：它是全器件 RMS，暗态在 res=1e6 时
-         * 就已低于 1e-2，提前停会让亮态 J-V 崩掉（Jsc 变负、FF=nan）。 */
+         * 阈值 1e-2 比上面的提前放行（1e-3）宽松：这里 Newton 已经走不动，
+         * 只能确认解没有明显不平衡；正常收敛仍靠 rn<tol 或上面的 1e-3。 */
         if (alpha * dumax < 1e-7) {
             double rel_now = 0.0;
             residual(m, u, utmp, nb2, pb2, rn2, &rel_now);
@@ -792,10 +903,11 @@ static void eq_dens(const pvk_model* m, int i, double u, double* nout, double* p
 }
 
 static double eq_residual(const pvk_model* m, const double* u, double* r,
-                          double* nb, double* pb) {
+                          double* nb, double* pb, double* relrow_out) {
     int n = m->n;
     double Vt = m->Vt;
     double rsum2 = 0.0;
+    double relsum2 = 0.0;
 
     for (int i = 0; i < n; i++) {
         eq_dens(m, i, u[i], &nb[i], &pb[i]);
@@ -803,10 +915,24 @@ static double eq_residual(const pvk_model* m, const double* u, double* r,
         if (!isfinite(pb[i])) pb[i] = 1e300;
     }
 
+    /* 线搜索用的 merit：全器件统一尺度 Cref 归一。
+     * 逐节点归一化的 den 会随迭代变化，界面节点 den~1e20、体内节点
+     * den~1e-5，舍入噪声就能让 RMS 不下降，Newton 方向并非它的下降
+     * 方向 —— refine>0 时 homotopy 在 t=0 就卡死就是这个原因。
+     * 统一尺度等价于给方程乘常数，不改变 Newton 方向。 */
+    double Cref = 1e10;
+    for (int i = 0; i < n; i++) {
+        double s = m->Nc[i] > m->Nv[i] ? m->Nc[i] : m->Nv[i];
+        double d = m->Nd[i] + m->Na[i];
+        if (d > s) s = d;
+        if (s > Cref) Cref = s;
+    }
+
     for (int i = 0; i < n; i++) {
         if (m->bc[i]) {
             r[i] = u[i] - m->u_bc[m->bc[i] - 1];
             rsum2 += r[i] * r[i];
+            relsum2 += r[i] * r[i];
             continue;
         }
         double hL = m->h[i-1], hR = m->h[i], hc = m->hc[i];
@@ -815,11 +941,21 @@ static double eq_residual(const pvk_model* m, const double* u, double* r,
         double ft = (fluxR - fluxL) / (PVK_Q_C * hc);
         double ct = pb[i] - nb[i] + m->Nd[i] - m->Na[i];
         r[i] = ft + ct;
+        double a = r[i] / Cref;
+        rsum2 += a * a;
+        /* 逐节点相对残差只做“收敛确认”，不参与线搜索：界面节点的通量
+         * 尺度 ~1e20、体内 ~1e-5，用它当 merit 会让线搜索永远不下降。
+         * 下限取 1e10 cm⁻³（而不是 1）：绝对残差即使已到机器精度
+         * （rn~1e-17 即 ~1e3 cm⁻³），除以下限 1 也会得到 O(1) 的假
+         * “不平衡”。1e10 cm⁻³ 折算到 1 nm 网格只有 ~1e-3 V/cm 的场误差。 */
         double den = fabs(ft);
         if (fabs(ct) > den) den = fabs(ct);
-        if (den < 1.0) den = 1.0;
-        double a = r[i] / den;
-        rsum2 += a * a;
+        if (den < 1e10) den = 1e10;
+        double ar = r[i] / den;
+        relsum2 += ar * ar;
+    }
+    if (relrow_out) {
+        *relrow_out = isfinite(relsum2) ? sqrt(relsum2 / (double)n) : 1e300;
     }
     if (!isfinite(rsum2)) return 1e300;
     return sqrt(rsum2 / (double)n);
@@ -847,11 +983,14 @@ static void eq_neutral_guess(const pvk_model* m, double* u) {
     }
 }
 
-/* 从给定初值解非线性 Poisson（只解 ψ，φn=φp=0），返回最终归一化残差。 */
+/* 从给定初值解非线性 Poisson（只解 ψ，φn=φp=0），返回最终归一化残差。
+ * relrow_out（可空）返回最后的逐节点相对残差，供 homotopy 判质量。 */
 static double solve_poisson_newton(const pvk_model* m, double* u,
-                                   const pvk_solver_opts* opts) {
+                                   const pvk_solver_opts* opts,
+                                   double* relrow_out) {
     int n = m->n;
     double rn = 1e300;
+    if (relrow_out) *relrow_out = 1e300;
     double* r  = (double*)pvk__malloc(sizeof(double) * n);
     double* rt = (double*)pvk__malloc(sizeof(double) * n);
     double* ut = (double*)pvk__malloc(sizeof(double) * n);
@@ -864,14 +1003,19 @@ static double solve_poisson_newton(const pvk_model* m, double* u,
     if (!r || !rt || !ut || !nb || !pb || !nb2 || !pb2 || !A || !du) goto done_free;
 
     double tol = opts && opts->res_tol > 0 ? opts->res_tol : 1e-8;
-    rn = eq_residual(m, u, r, nb, pb);
+    double rr = 1e300;
+    rn = eq_residual(m, u, r, nb, pb, &rr);
 
-    for (int it = 0; it < 80 && rn > tol; it++) {
+    /* 双判据：全局尺度 rn 保证“大项”都解到位，逐节点相对 rr 保证体内
+     * 那些绝对值很小、但相对自身量级仍差很多的方程也解到位。只用 rn
+     * 会在 1e-8 就放行（此时界面节点的通量还差 ~80%），亮态随后发散；
+     * 只用 rr 则线搜索不下降（见 eq_residual 的注释）。 */
+    for (int it = 0; it < 80 && (rn > tol || rr > 1e-3); it++) {
         for (int j = 0; j < n; j++) {
             double save = u[j];
             double hstep = 1e-7 * (fabs(save) > 1.0 ? fabs(save) : 1.0);
             u[j] = save + hstep;
-            eq_residual(m, u, rt, nb2, pb2);
+            eq_residual(m, u, rt, nb2, pb2, NULL);
             u[j] = save;
             double inv = 1.0 / hstep;
             for (int i = 0; i < n; i++) A[(size_t)i * n + j] = (rt[i] - r[i]) * inv;
@@ -882,37 +1026,61 @@ static double solve_poisson_newton(const pvk_model* m, double* u,
             break;
         }
 
-        /* 步长限幅（≈0.5 V），避免指数型电荷让第一个 Newton 步爆掉 */
+        /* 步长限幅（≈3 V）：界面处带边差可达 ~2 eV（≈80 Vt），限得太死
+         * 会把 Newton 方向截断成非下降方向，线搜索在 it=0 就必然失败。 */
         double dumax = 0.0;
         for (int i = 0; i < n; i++) {
             if (m->bc[i]) continue;
-            if (du[i] > 20.0) du[i] = 20.0;
-            if (du[i] < -20.0) du[i] = -20.0;
+            if (du[i] > 120.0) du[i] = 120.0;
+            if (du[i] < -120.0) du[i] = -120.0;
             if (fabs(du[i]) > dumax) dumax = fabs(du[i]);
         }
 
-        double alpha = 1.0, rnew = rn;
+        double alpha = 1.0, rnew = rn, rrnew = rr;
         int ok = 0;
         for (int t = 0; t < 16; t++) {
             for (int i = 0; i < n; i++) ut[i] = u[i] + alpha * du[i];
-            rnew = eq_residual(m, ut, rt, nb2, pb2);
+            rnew = eq_residual(m, ut, rt, nb2, pb2, &rrnew);
             if (isfinite(rnew) && rnew <= rn * (1.0 - 1e-4 * alpha)) { ok = 1; break; }
             alpha *= 0.5;
         }
         if (!ok) {
-            if (getenv("PVK_DEBUG")) fprintf(stderr, "[pvk] eq: line search failed it=%d rn=%.3e\n", it, rn);
+            if (getenv("PVK_DEBUG")) {
+                fprintf(stderr, "[pvk] eq: line search failed it=%d rn=%.3e dumax=%.3e\n",
+                        it, rn, dumax);
+                for (int k = 0; k < 3; k++) {
+                    int imax = -1; double vmax = 0.0;
+                    for (int i = 0; i < n; i++) {
+                        double v = fabs(r[i]);
+                        if (v > vmax) { vmax = v; imax = i; }
+                    }
+                    if (imax < 0) break;
+                    fprintf(stderr,
+                            "[pvk]   worst r=%.3e node=%d layer=%d x=%.3f nm u=%.4f\n",
+                            r[imax], imax, m->node_layer[imax],
+                            m->x[imax] * 1e7, u[imax]);
+                    r[imax] = 0.0;
+                }
+            }
             break;
         }
         memcpy(u, ut, sizeof(double) * n);
         for (int i = 0; i < n; i++) r[i] = rt[i];
         rn = rnew;
+        rr = rrnew;
         /* 注意：不能用 du[0] 判停 —— 节点 0 是钉死的 Dirichlet 行，
          * du[0] 恒为 0，会让平衡态 Newton 只走一步（这正是暗态初值
          * 一直不收敛的根因之一）。用自由节点的最大步长。 */
         if (alpha * dumax < 1e-10) break;
     }
-    if (getenv("PVK_DEBUG"))
-        fprintf(stderr, "[pvk] solve_equilibrium: rn=%.3e\n", rn);
+    if (relrow_out) *relrow_out = rr;
+    if (getenv("PVK_DEBUG")) {
+        if (relrow_out)
+            fprintf(stderr, "[pvk] solve_equilibrium: rn=%.3e relrow=%.3e\n",
+                    rn, rr);
+        else
+            fprintf(stderr, "[pvk] solve_equilibrium: rn=%.3e\n", rn);
+    }
 
 done_free:
     pvk__free(r); pvk__free(rt); pvk__free(ut);
@@ -960,10 +1128,18 @@ static void equilibrium_guess(pvk_ctx* ctx, const pvk_device* dev,
                  * 接触的第一层网格上 —— 网格越细这个台阶的相对跨度越大，
                  * nodes=797（1.28 nm）时 Newton 在 it=0 就线搜索失败，
                  * homotopy 直接停在 t=0。线性插值让接触附近的电势梯度与
-                 * 网格无关。 */
+                 * 网格无关。
+                 *
+                 * 锚点必须取**首末自由节点**：理想 Ohmic 的 Dirichlet 行
+                 * 被内移到紧邻电极的半导体节点上，若仍按 x[0]/x[n-1] 插值，
+                 * 那个 pin 住的节点与其后第一个自由节点（refine>0 时相距
+                 * 0.1 nm）之间会多出一个 V_app 的台阶，Poisson 残差 1e20。 */
+                int ifree = 0, ilast = n - 1;
+                while (ifree + 1 < n && lm.bc[ifree]) ifree++;
+                while (ilast > 0 && lm.bc[ilast]) ilast--;
                 double uL = lm.u_bc[0];
                 double uR = lm.u_bc[1];
-                double x0 = lm.x[0], x1 = lm.x[n - 1];
+                double x0 = lm.x[ifree], x1 = lm.x[ilast];
                 double dx = (x1 > x0) ? (x1 - x0) : 1.0;
                 for (int i = 0; i < n; i++) {
                     if (lm.bc[i]) continue;
@@ -974,13 +1150,15 @@ static void equilibrium_guess(pvk_ctx* ctx, const pvk_device* dev,
             for (int i = 0; i < n; i++)
                 if (lm.bc[i]) u[i] = lm.u_bc[lm.bc[i] - 1];
 
-            double rn = solve_poisson_newton(&lm, u, opts);
+            double relrow = 1e300;
+            double rn = solve_poisson_newton(&lm, u, opts, &relrow);
             model_free(&lm);
 
-            /* 这里是“初值的初值”，不要求解到收敛：残差降到 1e-3 就够，
-             * 让 homotopy 能一路走到 homo=1（真实参数），剩下的精度
-             * 交给完整 3n 方程的 Newton。 */
-            if (rn < 1e-3) {
+            /* 这里是“初值的初值”，不要求解到机器精度，但必须真的是
+             * 平衡态：只看全局尺度 rn 会在体内电荷仍差 ~1e17 cm⁻³ 时
+             * 就放行，亮态随后在 TiO2/钙钛矿界面处把 n 推到 1e25 发散。
+             * 所以再加一道逐节点相对残差（<1e-3）。 */
+            if (rn < 1e-3 && relrow < 1e-3) {
                 ok = 1;
                 did = 1;
                 t_done = t_try;
@@ -1010,6 +1188,68 @@ static void equilibrium_guess(pvk_ctx* ctx, const pvk_device* dev,
 /* ─────────────────────────────────────────────────────────────────────
  * 初始猜测
  * ───────────────────────────────────────────────────────────────────── */
+
+/* 标记接触层（隐式欧姆接触）。
+ *
+ * 从紧邻电极的第一个自由节点往里走，只要该层的**平衡**载流子密度
+ * （φ=0，只由 ψ 决定）还比 max(ni,1) 高 3 个数量级以上，就把它归入
+ * 接触层：这层即电极注入的积累层，厚度由德拜长度决定（~0.1–10 nm），
+ * 网格解析不了，连续性方程在这一层没有可靠的离散解。归入接触后，
+ * 它的 φn/φp 钉在电极值上（无限表面复合），ψ 仍由 Poisson 求解。
+ *
+ * 用平衡密度而不是当前密度：亮态下吸收层的 n 可以很高，但它不是
+ * 接触层，必须保留完整的双载流子方程。走到层边界就停，避免把 ETL/HTL
+ * 之外的吸收层卷进来。 */
+static void mark_contact_layer(pvk_model* m, const double* u) {
+    int n = m->n;
+    memset(m->cpl, 0, sizeof(unsigned char) * (size_t)n);
+
+    int i = 0;
+    while (i < n && m->bc[i]) i++;
+    if (i < n) {
+        int lay = m->node_layer[i];
+        for (; i < n && !m->bc[i] && m->node_layer[i] == lay; i++) {
+            double nn, pp, thr;
+            eq_dens(m, i, u[i], &nn, &pp);
+            thr = 1e3 * (m->ni[i] > 1.0 ? m->ni[i] : 1.0);
+            if (!(fmax(nn, pp) > thr)) break;
+            m->cpl[i] = 1;
+        }
+    }
+
+    int j = n - 1;
+    while (j >= 0 && m->bc[j]) j--;
+    if (j >= 0) {
+        int lay = m->node_layer[j];
+        for (; j >= 0 && !m->bc[j] && m->node_layer[j] == lay; j--) {
+            double nn, pp, thr;
+            eq_dens(m, j, u[j], &nn, &pp);
+            thr = 1e3 * (m->ni[j] > 1.0 ? m->ni[j] : 1.0);
+            if (!(fmax(nn, pp) > thr)) break;
+            m->cpl[j] = 2;
+        }
+    }
+
+    if (getenv("PVK_DEBUG")) {
+        int c1 = 0, c2 = 0;
+        for (int k = 0; k < n; k++) {
+            if (m->cpl[k] == 1) c1++;
+            else if (m->cpl[k] == 2) c2++;
+        }
+        fprintf(stderr, "[pvk] contact layer: cathode %d nodes, anode %d nodes\n", c1, c2);
+    }
+}
+
+/* 接触层节点的 φn/φp 取电极费米能级（与 residual 中的方程一致）。 */
+static void apply_contact_layer_qfl(const pvk_model* m, double* u) {
+    for (int i = 0; i < m->n; i++) {
+        if (!m->cpl[i]) continue;
+        int e = m->cpl[i] - 1;
+        u[m->n + i]     = m->wn_bc[e];
+        u[2 * m->n + i] = m->wp_bc[e];
+    }
+}
+
 static void initial_guess(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
                           double* u, int warm) {
     const int n = m->n;
@@ -1036,6 +1276,8 @@ static void initial_guess(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
                 u[n + i]   = m->wn_bc[e];
                 u[2*n + i] = m->wp_bc[e];
             }
+            mark_contact_layer(m, u);
+            apply_contact_layer_qfl(m, u);
             return;
         }
     }
@@ -1048,22 +1290,31 @@ static void initial_guess(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
 
     /* 光照下初值必须包含光生载流子。平衡态 homotopy 给的是 np=ni²，
      * 而亮态稳态要求 np ≈ ni² + G·τ；少这一项时少子密度只有 ~ni，
-     * 空穴连续性方程第一步就要求它跨十几个数量级，Newton 必然发散 ——
-     * 这是亮态 mode 0 一直解不动、只能靠 φp=φn 兜底的真正原因
-     * （把光强压到 1e-6 mW/cm² 仍然失败，而强度=0 时 13 步收敛）。
+     * 空穴连续性方程第一步就要求它跨十几个数量级，Newton 必然发散。
      *
-     * np = ni²·exp(u_n - u_p)，所以把准费米劈裂按 exp 均分到两端。 */
+     * 劈裂必须相对**当地平衡 np**（而不是 ni²）来定，并且只抬少子：
+     * 接触积累层里 n0 可比 ni 高十几个数量级，按 ni² 算出的 split
+     * （TiO2 里可达 1.4 eV）再均分到两端，会把 n 抬到 1e31 —— 亮态
+     * V=0 冷启动的初始残差 1e39 就是这么来的。只抬少子则多数载流子
+     * 不动，np 恰好达标。 */
     for (int i = 0; i < n; i++) {
         if (m->bc[i] || !(m->G[i] > 0.0)) continue;
         double ni = m->ni[i];
         if (!(ni > 0.0)) continue;
+        double n0, p0;
+        node_dens(m, i, u, &n0, &p0);
+        double np0 = n0 * p0;
+        if (!(np0 > 0.0) || !isfinite(np0)) continue;
         double tau = 1.0 / (1.0 / m->taun[i] + 1.0 / m->taup[i]);
         double np_t = ni * ni + m->G[i] * tau;
-        double split = Vt * log(np_t / (ni * ni));
+        double split = Vt * log(np_t / np0);
         if (!(split > 0.0) || !isfinite(split)) continue;
-        if (split > 4.0) split = 4.0;   /* 限幅，避免初值过冲 */
-        u[n + i]     =  0.5 * split / Vt;
-        u[2*n + i]   = -0.5 * split / Vt;
+        if (split > 1.2) split = 1.2;   /* 上限 ≈ 1.2 eV，避免初值过冲 */
+        if (n0 >= p0) {
+            u[2*n + i] = -split / Vt;   /* n 型：抬空穴（少子） */
+        } else {
+            u[n + i]   =  split / Vt;   /* p 型：抬电子（少子） */
+        }
     }
 
     /* 电极层所有节点钉死 */
@@ -1074,6 +1325,9 @@ static void initial_guess(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
         u[n + i]     = m->wn_bc[e];
         u[2*n + i]   = m->wp_bc[e];
     }
+
+    mark_contact_layer(m, u);
+    apply_contact_layer_qfl(m, u);
 }
 
 /* ─────────────────────────────────────────────────────────────────────
@@ -1156,8 +1410,10 @@ static void fill_fields(pvk_ctx* ctx, pvk_model* m, const double* u,
      * 在 101/201/397/797 上 Jsc 各不相同、一开界面加密就跳到 4.2 的来源。 */
     int iL = -1, iR = -1;
     for (int i = 0; i < n - 1; i++) {
-        if (m->bc[i] && !m->bc[i + 1] && iL < 0) iL = i;
-        if (!m->bc[i] && m->bc[i + 1]) iR = i;
+        int pinL = m->bc[i] || m->cpl[i];
+        int pinR = m->bc[i+1] || m->cpl[i+1];
+        if (pinL && !pinR && iL < 0) iL = i;
+        if (!pinL && pinR) iR = i;
     }
     if (J_out) {
         if (iL >= 0 && iR >= 0) {
