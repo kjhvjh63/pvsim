@@ -1,4 +1,4 @@
-/*
+﻿/*
  * solver.c — 一维漂移扩散 + 泊松，阻尼 Newton 求解。
  *
  * 未知量（每个节点 3 个，全部无量纲化：电位 / Vt）：
@@ -461,6 +461,95 @@ static int dense_solve(double* A, double* b, int nn) {
 }
 
 /* ─────────────────────────────────────────────────────────────────────
+ * 带状 LU（部分选主元）
+ *
+ * 残差按（方程类型 t, 节点 i）排列、未知量按（变量类型 s, 节点 j）排列时，
+ * 每个方程只耦合 j = i-1,i,i+1。把未知量和方程都重排成“节点主序”
+ * （r = 3i+t, c = 3j+s）后，矩阵是带宽 5 的带状矩阵：
+ *   |r-c| = |3(i-j)+(t-s)| <= 3+2 = 5
+ * 带状 LU（下带宽 5、上带宽 5）配合部分选主元，复杂度 O(n)，且主元
+ * 可以跨节点交换 —— 这是块 Thomas 做不到的（它对近奇异对角块不稳）。
+ *
+ * 选主元后上带宽会增长到 下带宽+上带宽 = 10（标准结论），所以按
+ * BL=5、BU=10 存储，共 16 条对角线。A(r,c) 存在 ab[r*16 + (c-r+5)]。
+ * ───────────────────────────────────────────────────────────────────── */
+#define PVK_BW_L 5
+#define PVK_BW_U 10
+#define PVK_BW_W (PVK_BW_L + PVK_BW_U + 1)
+
+/* 行均衡 + 对角正则 + 带状 LU + 回代；b 既作右端也作解。 */
+static int band_solve(int nn, double* ab, double* b) {
+    const int w = PVK_BW_W;
+
+    for (int i = 0; i < nn; i++) {
+        double* row = ab + (size_t)i * w;
+        double s = 0.0;
+        for (int k = 0; k < w; k++) {
+            double v = fabs(row[k]);
+            if (v > s) s = v;
+        }
+        if (!(s > 1e-290) || !isfinite(s)) {
+            if (getenv("PVK_DEBUG"))
+                fprintf(stderr, "[pvk] band row %d degenerate (freeze)\n", i);
+            for (int k = 0; k < w; k++) row[k] = 0.0;
+            row[PVK_BW_L] = 1.0;
+            b[i] = 0.0;
+            continue;
+        }
+        double inv = 1.0 / s;
+        for (int k = 0; k < w; k++) row[k] *= inv;
+        b[i] *= inv;
+    }
+    for (int i = 0; i < nn; i++) ab[(size_t)i * w + PVK_BW_L] += 1e-10;
+
+    for (int k = 0; k < nn; k++) {
+        int rmax = k + PVK_BW_L;
+        if (rmax >= nn) rmax = nn - 1;
+        int piv = k;
+        double best = fabs(ab[(size_t)k * w + PVK_BW_L]);
+        for (int r = k + 1; r <= rmax; r++) {
+            double v = fabs(ab[(size_t)r * w + (k - r + PVK_BW_L)]);
+            if (v > best) { best = v; piv = r; }
+        }
+        if (!(best > 1e-14) || !isfinite(best)) return -1;
+        if (piv != k) {
+            int c0 = piv - PVK_BW_L; if (c0 < 0) c0 = 0;
+            int c1 = k + PVK_BW_U;   if (c1 >= nn) c1 = nn - 1;
+            for (int c = c0; c <= c1; c++) {
+                double* rk = ab + (size_t)k   * w + (c - k   + PVK_BW_L);
+                double* rp = ab + (size_t)piv * w + (c - piv + PVK_BW_L);
+                double t = *rk; *rk = *rp; *rp = t;
+            }
+            double t = b[k]; b[k] = b[piv]; b[piv] = t;
+        }
+        double akk = ab[(size_t)k * w + PVK_BW_L];
+        for (int i = k + 1; i <= rmax; i++) {
+            double* ri = ab + (size_t)i * w;
+            double f = ri[k - i + PVK_BW_L] / akk;
+            if (f == 0.0) continue;
+            ri[k - i + PVK_BW_L] = 0.0;
+            int cmax = k + PVK_BW_U; if (cmax >= nn) cmax = nn - 1;
+            if (i + PVK_BW_U < cmax) cmax = i + PVK_BW_U;
+            for (int c = k + 1; c <= cmax; c++)
+                ri[c - i + PVK_BW_L] -= f * ab[(size_t)k * w + (c - k + PVK_BW_L)];
+            b[i] -= f * b[k];
+        }
+    }
+
+    for (int i = nn - 1; i >= 0; i--) {
+        double s = b[i];
+        int cmax = i + PVK_BW_U; if (cmax >= nn) cmax = nn - 1;
+        for (int c = i + 1; c <= cmax; c++)
+            s -= ab[(size_t)i * w + (c - i + PVK_BW_L)] * b[c];
+        double aii = ab[(size_t)i * w + PVK_BW_L];
+        if (!(fabs(aii) > 1e-300) || !isfinite(aii)) return -1;
+        b[i] = s / aii;
+    }
+    for (int i = 0; i < nn; i++) if (!isfinite(b[i])) return -1;
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
  * 模型构建 / 释放
  * ───────────────────────────────────────────────────────────────────── */
 static void model_free(pvk_model* m) {
@@ -733,7 +822,10 @@ static int solve_newton(pvk_model* m, double* u,
     double* rtmp   = (double*)pvk__malloc(sizeof(double) * nn);
     double* utmp   = (double*)pvk__malloc(sizeof(double) * nn);
     double* du     = (double*)pvk__malloc(sizeof(double) * nn);
-    double* A      = (double*)pvk__malloc(sizeof(double) * (size_t)nn * nn);
+    /* 带状 LU：方程/未知量按节点主序（3i+t），带宽 5，
+     * 存储宽度 BL+BU=15（选主元后上带宽增长，见 band_solve） */
+    double* band   = (double*)pvk__malloc(sizeof(double) * PVK_BW_W * (size_t)nn);
+    double* bvec   = (double*)pvk__malloc(sizeof(double) * nn);
     double* nbuf   = (double*)pvk__malloc(sizeof(double) * n);
     double* pbuf   = (double*)pvk__malloc(sizeof(double) * n);
     double* rnet   = (double*)pvk__malloc(sizeof(double) * n);
@@ -741,10 +833,11 @@ static int solve_newton(pvk_model* m, double* u,
     double* pb2    = (double*)pvk__malloc(sizeof(double) * n);
     double* rn2    = (double*)pvk__malloc(sizeof(double) * n);
 
-    if (!r || !rtmp || !utmp || !du || !A || !nbuf || !pbuf || !rnet ||
-        !nb2 || !pb2 || !rn2) {
+    if (!r || !rtmp || !utmp || !du || !band || !bvec ||
+        !nbuf || !pbuf || !rnet || !nb2 || !pb2 || !rn2) {
         pvk__free(r); pvk__free(rtmp); pvk__free(utmp); pvk__free(du);
-        pvk__free(A); pvk__free(nbuf); pvk__free(pbuf); pvk__free(rnet);
+        pvk__free(band); pvk__free(bvec);
+        pvk__free(nbuf); pvk__free(pbuf); pvk__free(rnet);
         pvk__free(nb2); pvk__free(pb2); pvk__free(rn2);
         return PVK_EMEM;
     }
@@ -769,26 +862,48 @@ static int solve_newton(pvk_model* m, double* u,
             !(rel_prev < 1e-2 && rel_prev < 0.98 * rel_prev2)) break;
         if (rn < tol) { converged = 1; break; }
 
-        /* ---- 数值雅可比（前向差分） ---- */
-        for (int j = 0; j < nn; j++) {
-            double save = u[j];
-            double hstep = 1e-7 * (fabs(save) > 1.0 ? fabs(save) : 1.0);
-            u[j] = save + hstep;
-            residual(m, u, rtmp, nb2, pb2, rn2, NULL);
-            u[j] = save;
-            double inv = 1.0 / hstep;
-            for (int i = 0; i < nn; i++) {
-                A[(size_t)i * nn + j] = (rtmp[i] - r[i]) * inv;
+        if (getenv("PVK_DEBUG"))
+            fprintf(stderr, "[pvk] it=%d rn=%.6e\n", it, rn);
+
+        /* ---- 数值雅可比（前向差分，直接写入带状存储） ----
+         * 变量 j = s*n + jn 只影响 jn-1/jn/jn+1 三个节点的残差行，
+         * 所以只需填 3*3 个元素，不必碰 O(n²) 的稠密矩阵。 */
+        memset(band, 0, sizeof(double) * PVK_BW_W * (size_t)nn);
+        for (int jn = 0; jn < n; jn++) {
+            for (int s = 0; s < 3; s++) {
+                int j = s * n + jn;
+                double save = u[j];
+                double hstep = 1e-7 * (fabs(save) > 1.0 ? fabs(save) : 1.0);
+                u[j] = save + hstep;
+                residual(m, u, rtmp, nb2, pb2, rn2, NULL);
+                u[j] = save;
+                double inv = 1.0 / hstep;
+                for (int i = jn - 1; i <= jn + 1; i++) {
+                    if (i < 0 || i >= n) continue;
+                    for (int t = 0; t < 3; t++) {
+                        int row = 3 * i + t;
+                        int col = 3 * jn + s;
+                        band[(size_t)row * PVK_BW_W + (col - row + PVK_BW_L)] =
+                            (rtmp[t * n + i] - r[t * n + i]) * inv;
+                    }
+                }
             }
         }
 
-        for (int i = 0; i < nn; i++) du[i] = -r[i];
+        /* b = -r（节点主序：3i+t） */
+        for (int i = 0; i < n; i++)
+            for (int t = 0; t < 3; t++)
+                bvec[3 * i + t] = -r[t * n + i];
 
-        if (dense_solve(A, du, nn) != 0) {
-            if (getenv("PVK_DEBUG")) fprintf(stderr, "[pvk] dense_solve failed at it=%d\n", it);
+        if (band_solve(nn, band, bvec) != 0) {
+            if (getenv("PVK_DEBUG"))
+                fprintf(stderr, "[pvk] band solve failed at it=%d\n", it);
             status = PVK_ECONV;
             break;
         }
+        for (int i = 0; i < n; i++)
+            for (int s = 0; s < 3; s++)
+                du[s * n + i] = bvec[3 * i + s];
 
         double dumax = 0.0;
         for (int i = 0; i < nn; i++) {
@@ -883,7 +998,8 @@ static int solve_newton(pvk_model* m, double* u,
     out->converged = converged ? 1 : 0;
 
     pvk__free(r); pvk__free(rtmp); pvk__free(utmp); pvk__free(du);
-    pvk__free(A); pvk__free(nbuf); pvk__free(pbuf); pvk__free(rnet);
+    pvk__free(band); pvk__free(bvec);
+    pvk__free(nbuf); pvk__free(pbuf); pvk__free(rnet);
     pvk__free(nb2); pvk__free(pb2); pvk__free(rn2);
     return status;
 }
