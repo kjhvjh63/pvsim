@@ -288,7 +288,7 @@ class DeviceSpec:
     layers:                 Tuple[LayerSpec, ...]   # 层栈，顺序 = 从 anode 侧起
     T_K:                    float         = 300.0
     nodes:                  int           = 101      # 目标网格点数（实际可能因加密而略多）
-    interface_refine:       float         = 0.0      # 界面加密比例，0=关闭
+    interface_refine:       float         = 1.0      # 界面加密比例；0=关闭（仅作粗网格预览，接触层无法解析）
 
     def __post_init__(self):
         # 接受 list / 任意 Iterable → 转为 tuple 保证 frozen 安全
@@ -359,7 +359,7 @@ class DeviceSpec:
             layers=layers,
             T_K=float(d.get("T_K", 300.0)),
             nodes=int(d.get("nodes", 101)),
-            interface_refine=float(d.get("interface_refine", 0.0)),
+            interface_refine=float(d.get("interface_refine", 1.0)),
         )
 
 

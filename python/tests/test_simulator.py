@@ -233,6 +233,49 @@ check("带缺陷 spec 可求解", res_def.converged)
 
 
 # ---------------------------------------------------------------------------
+# 7. 网格与接触层回归（A′）
+# ---------------------------------------------------------------------------
+
+section("7. 网格与接触层回归")
+
+
+def _coarse_spec(nodes, refine):
+    """0→1.2 V、13 点：覆盖接触层隐式处理修复前的失效区（V>1.1）。"""
+    return replace(spec,
+                   device=replace(spec.device, nodes=nodes, interface_refine=refine),
+                   sweep=replace(spec.sweep, v_start=0.0, v_stop=1.2, n_points=13))
+
+
+spec_dark = replace(spec,
+                    device=replace(spec.device, nodes=101, interface_refine=1.0),
+                    optics=replace(spec.optics, intensity_mW_cm2=0.0),
+                    sweep=replace(spec.sweep, v_start=0.0, v_stop=0.0, n_points=1))
+res_dark = Simulator().run(spec_dark)
+check("暗态 refine=1 收敛", res_dark.points[0].converged)
+check("暗态 refine=1 J≈0", abs(res_dark.points[0].J_mA_cm2) < 1e-6,
+      f"got {res_dark.points[0].J_mA_cm2}")
+
+res_fine = Simulator().run(_coarse_spec(201, 2.0))
+check("201/refine=2 全 13 点收敛", res_fine.converged,
+      f"{sum(p.converged for p in res_fine.points)}/13")
+check("201/refine=2 Jsc > 20", res_fine.jv.Jsc > 20.0, f"got {res_fine.jv.Jsc}")
+check("201/refine=2 Voc 合理", 1.05 < res_fine.jv.Voc < 1.10,
+      f"got {res_fine.jv.Voc}")
+check("201/refine=2 FF 合理", 0.5 < res_fine.jv.FF < 0.6, f"got {res_fine.jv.FF}")
+_j = [p.J_mA_cm2 for p in res_fine.points]
+check("201/refine=2 J-V 单调递增",
+      all(_j[i + 1] >= _j[i] - 1e-3 for i in range(len(_j) - 1)), str(_j))
+
+res_coarse = Simulator().run(_coarse_spec(101, 1.0))
+d_jsc = abs(res_fine.jv.Jsc - res_coarse.jv.Jsc) / res_coarse.jv.Jsc
+d_voc = abs(res_fine.jv.Voc - res_coarse.jv.Voc)
+d_ff = abs(res_fine.jv.FF - res_coarse.jv.FF)
+check("Jsc 网格差 < 0.5%", d_jsc < 5e-3, f"{d_jsc:.2e}")
+check("Voc 网格差 < 1 mV", d_voc < 1e-3, f"{d_voc:.2e}")
+check("FF 网格差 < 0.003", d_ff < 3e-3, f"{d_ff:.2e}")
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
