@@ -20,6 +20,7 @@ from typing import Any, List, Optional
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
+from ..dataio import SilvacoLogWriter, write_jv_csv
 from ..param.schema import SpecError
 from ..script import DeckCompiler, DeckSyntaxError
 from ..solver import Simulator
@@ -92,6 +93,7 @@ class App(tk.Tk):
             on_quit=self.close,
             on_mesh=self.edit_mesh, on_physics=self.edit_physics,
             on_solve=self.edit_solve, on_output=self.edit_output,
+            on_compile=self.check_compile, on_export=self.export_results,
             examples=self._example_decks(), on_example=self.load_example,
         )
         self.configure(menu=menubar)
@@ -100,8 +102,12 @@ class App(tk.Tk):
         toolbar.pack(side=tk.TOP, fill=tk.X)
         ttk.Button(toolbar, text="打开", command=self.open_deck).pack(side=tk.LEFT)
         ttk.Button(toolbar, text="保存", command=self.save_deck).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="编译", command=self.check_compile).pack(
+            side=tk.LEFT, padx=(0, 4))
         self._run_btn = ttk.Button(toolbar, text="运行 (F5)", command=self.run_current)
         self._run_btn.pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="导出", command=self.export_results).pack(
+            side=tk.LEFT, padx=(0, 4))
 
         ttk.Label(toolbar, text="图：").pack(side=tk.LEFT, padx=(16, 2))
         labels = self._plot_labels()
@@ -174,6 +180,7 @@ class App(tk.Tk):
         self.bind("<F5>", lambda _e: self.run_current())
         self.bind("<Control-o>", lambda _e: self.open_deck())
         self.bind("<Control-s>", lambda _e: self.save_deck())
+        self.bind("<Control-k>", lambda _e: self.check_compile())
 
     def _plot_labels(self) -> List[str]:
         return [f"{self.registry.get(pid).group} · {self.registry.get(pid).title}"
@@ -309,6 +316,52 @@ class App(tk.Tk):
                 f"{getattr(p, 'V', 0.0):.3f}",
                 f"{getattr(p, 'J_mA_cm2', 0.0):.4f}",
                 "是" if getattr(p, "converged", False) else "否"))
+
+    # ------------------------------------------------------------------
+    # 编译检查 / 导出
+    # ------------------------------------------------------------------
+    def check_compile(self) -> None:
+        """只编译不求解：DeckBuild 里对应 "Deck → Compile"。"""
+        try:
+            self.spec = self.compiler.compile_text(self.editor.get_text())
+        except (SpecError, DeckSyntaxError) as exc:
+            self.log(_LOG_ERROR, f"编译失败：{exc}")
+            for detail in getattr(exc, "details", ()):
+                self.log(_LOG_ERROR, f"  - {detail}")
+            messagebox.showerror("编译失败", str(exc))
+            return
+        self._refresh_structure()
+        text = (f"编译通过：{len(self.spec.device.layers)} 层 / "
+                f"{self.spec.sweep.v_start:g}→{self.spec.sweep.v_stop:g} V / "
+                f"{self.spec.sweep.n_points} 点 / run={self.spec.output.run_name}")
+        self.log(_LOG_INFO, text)
+        self._status.set(text)
+
+    def export_results(self) -> None:
+        """导出 J-V：Silvaco SSF (.log) 或 CSV。"""
+        if self.result is None:
+            self.log(_LOG_WARN, "还没有结果可导出，先运行一次求解")
+            return
+        chosen = filedialog.asksaveasfilename(
+            title="导出 J-V", defaultextension=".log",
+            initialdir=str(self.workspace / "results"),
+            filetypes=[("Silvaco SSF (.log)", "*.log"), ("CSV", "*.csv")])
+        if not chosen:
+            return
+        path = Path(chosen)
+        try:
+            if path.suffix.lower() == ".csv":
+                write_jv_csv(self.result.jv, path)
+            else:
+                title = (self.spec.output.run_name
+                         if self.spec is not None else "PVK Simulator")
+                SilvacoLogWriter().write(
+                    self.result.jv, path, title=title,
+                    run_id=getattr(self.result, "run_id", ""))
+        except OSError as exc:
+            self.log(_LOG_ERROR, f"导出失败：{exc}")
+            return
+        self.log(_LOG_INFO, f"已导出：{path}")
 
     # ------------------------------------------------------------------
     # 求解

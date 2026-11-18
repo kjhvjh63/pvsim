@@ -5,9 +5,17 @@
 """
 
 from .result_store import LAYOUT_VERSION, ResultStore, RunHandle
-from .silvaco_log import LogTable, SilvacoLogReader, SilvacoLogWriter
+from .silvaco_log import (
+    CSV_HEADER,
+    LogTable,
+    SilvacoLogReader,
+    SilvacoLogWriter,
+    jv_to_csv,
+    write_jv_csv,
+)
 
 __all__ = [
     "ResultStore", "RunHandle", "LAYOUT_VERSION",
     "SilvacoLogReader", "SilvacoLogWriter", "LogTable",
+    "CSV_HEADER", "jv_to_csv", "write_jv_csv",
 ]

@@ -44,6 +44,8 @@ def build_menu_bar(root: tk.Misc, registry: PlotRegistry, *,
                    on_physics: Optional[Callable[[], None]] = None,
                    on_solve: Optional[Callable[[], None]] = None,
                    on_output: Optional[Callable[[], None]] = None,
+                   on_compile: Optional[Callable[[], None]] = None,
+                   on_export: Optional[Callable[[], None]] = None,
                    examples: Sequence[Tuple[str, str]] = (),
                    on_example: Optional[Callable[[str], None]] = None) -> tk.Menu:
     """文件 / 网格 / 物理 / 求解 / 输出 / 绘图 / 帮助。
@@ -57,7 +59,12 @@ def build_menu_bar(root: tk.Misc, registry: PlotRegistry, *,
     file_menu.add_command(label="打开 deck…", command=on_open, accelerator="Ctrl+O")
     file_menu.add_command(label="保存 deck", command=on_save, accelerator="Ctrl+S")
     file_menu.add_separator()
+    if on_compile is not None:
+        file_menu.add_command(label="编译检查", command=on_compile,
+                              accelerator="Ctrl+K")
     file_menu.add_command(label="运行", command=on_run, accelerator="F5")
+    if on_export is not None:
+        file_menu.add_command(label="导出结果 (.log/.csv)…", command=on_export)
     file_menu.add_separator()
     file_menu.add_command(label="退出", command=on_quit)
     bar.add_cascade(label="文件", menu=file_menu)

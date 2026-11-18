@@ -283,6 +283,14 @@ if has_display:
             check("运行结束后按钮恢复",
                   "disabled" not in app._run_btn.state())
 
+            app.editor.set_text(MINIMAL_DECK)
+            app.check_compile()
+            check("编译检查刷新结构树",
+                  len(app.structure_tree.get_children()) == 3,
+                  str(len(app.structure_tree.get_children())))
+            check("编译检查更新状态栏",
+                  "编译通过" in app._status.get(), app._status.get())
+
             app.draw("cell_jv_curve")
             check("绘图产生 Axes", len(app.figure.axes) == 1)
             check("J-V 曲线已画", len(app.figure.axes[0].lines) >= 2,

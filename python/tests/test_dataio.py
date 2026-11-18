@@ -280,6 +280,28 @@ else:
 
 
 # ---------------------------------------------------------------------------
+# 9. CSV 导出（GUI「导出结果」走的第二出口）
+# ---------------------------------------------------------------------------
+
+section("9. jv csv export")
+
+from pvsim.dataio import CSV_HEADER, jv_to_csv, write_jv_csv
+
+csv_jv = JVData.from_points([0.0, 0.5, 1.0], [-20.0, -10.0, 0.0], 100.0)
+csv_text = jv_to_csv(csv_jv)
+csv_lines = csv_text.strip().splitlines()
+check("CSV 表头", csv_lines[0] == ",".join(CSV_HEADER), csv_lines[0])
+check("CSV 行数 = 点数 + 1", len(csv_lines) == 4, str(len(csv_lines)))
+check("CSV 功率列 = −J·V", csv_lines[2].split(",")[2] == "5",
+      csv_lines[2])
+
+with tempfile.TemporaryDirectory() as tmp:
+    csv_path = write_jv_csv(csv_jv, Path(tmp) / "jv.csv")
+    check("write_jv_csv 落盘", csv_path.exists())
+    check("CSV 往返一致", csv_path.read_text(encoding="utf-8") == csv_text)
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

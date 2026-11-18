@@ -139,6 +139,30 @@ class SilvacoLogWriter:
 
 
 # ---------------------------------------------------------------------------
+# CSV（给表格软件/脚本用，Silvaco .log 之外的第二出口）
+# ---------------------------------------------------------------------------
+
+CSV_HEADER = ("V_V", "J_mA_cm2", "P_mW_cm2")
+
+
+def jv_to_csv(jv: JVData) -> str:
+    """把 J-V 曲线转成三列 CSV 文本（P = −J·V）。"""
+    V = np.asarray(jv.V, dtype=float)
+    J = np.asarray(jv.J, dtype=float)
+    lines = [",".join(CSV_HEADER)]
+    for v, j in zip(V, J):
+        lines.append(f"{v:.6g},{j:.6g},{-j * v:.6g}")
+    return "\n".join(lines) + "\n"
+
+
+def write_jv_csv(jv: JVData, path: Path) -> Path:
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(jv_to_csv(jv), encoding="utf-8", newline="\n")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # 读
 # ---------------------------------------------------------------------------
 
