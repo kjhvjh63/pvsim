@@ -36,6 +36,8 @@ from pvsim.solver.simulator import Simulator             # noqa: E402
 DECK = ROOT.parent / "decks" / "device_example.tst"
 Q_E = 1.602176634e-19
 K_B = 8.617333262e-5   # eV/K
+# numpy 2.0 把 trapz 改名为 trapezoid，这里兼容两个版本
+_trapz = getattr(np, "trapezoid", None) or np.trapz
 
 _failed = 0
 
@@ -72,7 +74,7 @@ def main() -> int:
     sun = run(intensity=100.0)
     x = sun.fields.x_nm
     g = sun.fields["G_OPT"][0]
-    qG = Q_E * np.trapz(g, x * 1e-7) * 1e3      # mA/cm²
+    qG = Q_E * _trapz(g, x * 1e-7) * 1e3      # mA/cm²
     ratio = sun.jv.Jsc / qG
     check("Jsc ≤ q∫G dx", 0.0 < ratio <= 1.0 + 1e-9,
           f"Jsc={sun.jv.Jsc:.4f}, qG={qG:.4f}, 占比={ratio:.4f}")

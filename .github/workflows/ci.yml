@@ -18,7 +18,7 @@ jobs:
       - name: 安装依赖
         run: |
           python -m pip install --upgrade pip
-          pip install numpy matplotlib
+          pip install numpy matplotlib openpyxl
 
       - name: 构建 C 内核
         run: |
@@ -58,21 +58,6 @@ PY
           else
             echo "::warning::tkinter 不可用，跳过 test_gui"
           fi
-
-      - name: 失败摘要
-        if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # 把最后一行的异常写进 commit status 的 description（限 140 字），
-          # 便于在没有 gh/日志权限时也能通过 API 定位失败原因
-          msg=$(tail -n 1 test.log 2>/dev/null | cut -c1-120)
-          [ -n "$msg" ] || msg="build step failed"
-          jq -n --arg m "$msg" '{state:"failure",context:"ci/failure",description:$m}' \
-            | curl -s -X POST -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Accept: application/vnd.github+json" \
-                -H "Content-Type: application/json" --data-binary @- \
-                "https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }}" > /dev/null || true
 
       - name: 解析基准
         env:
