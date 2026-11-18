@@ -178,7 +178,7 @@ static double cont_scale(double jR, double jL, double hc, double smax) {
  * ───────────────────────────────────────────────────────────────────── */
 static double residual(const pvk_model* m, const double* u, double* r,
                        double* nbuf, double* pbuf, double* rnet,
-                       double* rel_out) {
+                       double* rel_out, double* hidden_out) {
     const int n = m->n;
 
     for (int i = 0; i < n; i++) {
@@ -207,6 +207,10 @@ static double residual(const pvk_model* m, const double* u, double* r,
     int    relcnt = 0;
     double relpeak = 0.0;  /* 峰值相对残差及其位置（诊断用） */
     int    reli = -1, relkind = -1;
+    /* 被 eq_minority 替换掉的行不再约束物理连续性；这里记录这些行
+     * "按真实方程算"的最大相对不平衡度。塌缩解（全层钉扎）靠删方程
+     * 让 rel/rn 同时假收敛，但隐藏行的物理不平衡仍是 O(1)，用它识破。 */
+    double hidden = 0.0;
 
     /* 全器件源项尺度：用来把"两边都接近 0、纯数值噪声"的行排除在
      * 相对残差之外（禁带很宽的传输层里 ni/τeff 小到没有意义）。
@@ -333,10 +337,22 @@ static double residual(const pvk_model* m, const double* u, double* r,
             if (e_deg) {
                 r[n + i] = u[n + i] - u[2*n + i];
                 REL_ACC_K(r[n + i], 3);
+                if (hidden_out && !iface_row) {
+                    double hp = fabs((jnR - jnL) / hc - src)
+                                / cont_scale(jnR, jnL, hc, smax);
+                    if (!isfinite(hp)) hp = 1e6;
+                    if (hp > hidden) hidden = hp;
+                }
             }
             if (p_deg) {
                 r[2 * n + i] = u[2*n + i] - u[n + i];
                 REL_ACC_K(r[2*n + i], 4);
+                if (hidden_out && !iface_row) {
+                    double hp = fabs((jpR - jpL) / hc + src)
+                                / cont_scale(jpR, jpL, hc, smax);
+                    if (!isfinite(hp)) hp = 1e6;
+                    if (hp > hidden) hidden = hp;
+                }
             }
             if (!e_deg) {
                 double den = nbuf[i] > 1e-280 ? nbuf[i] : 1e-280;
@@ -374,6 +390,7 @@ static double residual(const pvk_model* m, const double* u, double* r,
     }
     if (!isfinite(rmax) || !isfinite(rsum2)) {
         if (rel_out) *rel_out = 1e300;
+        if (hidden_out) *hidden_out = 1e300;
         return 1e300;
     }
     if (rel_out) {
@@ -387,6 +404,7 @@ static double residual(const pvk_model* m, const double* u, double* r,
                     m->x[reli] * 1e7, nbuf[reli], pbuf[reli]);
         }
     }
+    if (hidden_out) *hidden_out = hidden;
     /* 2-范数：Newton 方向是它的下降方向（∞-范数不保证），线搜索用它 */
     return sqrt(rsum2 / (double)(3 * n));
 }
@@ -860,13 +878,27 @@ static int model_init(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
     /* 理想 Ohmic 接触的边界条件施加在紧邻电极的那个半导体节点上。
      * 电极层整层仍钉死，但它与半导体之间的亚纳米积累层不再参与离散：
      * 1e20 的金属接触贴着本征层时德拜长度只有 ~0.2 nm，要求网格解析
-     * 这层会让暗态连续性残差按 1/h 增长（101→397 从 4.5 涨到 436）。 */
+     * 这层会让暗态连续性残差按 1/h 增长（101→397 从 4.5 涨到 436）。
+     *
+     * 前提：转换后该层必须还留有自由节点。否则整个薄层会被并入电极
+     * （1500nm 吸收层时 40nm TiO2 在 101 节点网格下只剩 1 个节点），
+     * mark_contact_layer 的首个自由节点就落进吸收层，"限本层"防线
+     * 失效，吸收层的积累尾巴被整段钉扎成电极——产生载流子没有输运
+     * 方程，亮态 Jsc 从 -21 塌到 -0.07 还被宽松判据报成收敛。
+     * 留不下第二个节点时不转换，该节点由 cpl 掩码按积累层处理，
+     * φ 钉扎效果等价，但吸收层不会再被卷进标记起点。 */
     {
         int first_free = -1, last_free = -1;
         for (int i = 0; i < n; i++) if (!m->bc[i]) { first_free = i; break; }
         for (int i = n - 1; i >= 0; i--) if (!m->bc[i]) { last_free = i; break; }
-        if (first_free > 0) m->bc[first_free] = m->bc[first_free - 1];
-        if (last_free >= 0 && last_free < n - 1) m->bc[last_free] = m->bc[last_free + 1];
+        if (first_free > 0 &&
+            first_free + 1 < n && !m->bc[first_free + 1] &&
+            m->node_layer[first_free + 1] == m->node_layer[first_free])
+            m->bc[first_free] = m->bc[first_free - 1];
+        if (last_free >= 0 && last_free < n - 1 &&
+            last_free - 1 >= 0 && !m->bc[last_free - 1] &&
+            m->node_layer[last_free - 1] == m->node_layer[last_free])
+            m->bc[last_free] = m->bc[last_free + 1];
     }
 
     m->u_bc[0]  = 0.0;
@@ -957,7 +989,7 @@ static int solve_newton(pvk_model* m, double* u,
     double alpha0 = opts && opts->damping > 0 ? opts->damping : 1.0;
     if (alpha0 > 1.0) alpha0 = 1.0;
 
-    double rn = residual(m, u, r, nbuf, pbuf, rnet, NULL);
+    double rn = residual(m, u, r, nbuf, pbuf, rnet, NULL, NULL);
     int converged = 0;
     int iters = 0;
     int status = PVK_OK;
@@ -1059,7 +1091,7 @@ static int solve_newton(pvk_model* m, double* u,
         int accepted = 0;
         for (int t = 0; t < 16; t++) {
             for (int i = 0; i < nn; i++) utmp[i] = u[i] + alpha * du[i];
-            rn_new = residual(m, utmp, rtmp, nb2, pb2, rn2, NULL);
+            rn_new = residual(m, utmp, rtmp, nb2, pb2, rn2, NULL, NULL);
             if (isfinite(rn_new) && rn_new <= rn * (1.0 - 1e-4 * alpha)) {
                 accepted = 1;
                 break;
@@ -1090,9 +1122,15 @@ static int solve_newton(pvk_model* m, double* u,
          * 下 rn~1e19 的病态解不会被误当成收敛（101/refine=1 的 J-V 曾
          * 因此出现 J 符号乱跳）。 */
         {
-            double rel_now = 0.0;
-            residual(m, u, utmp, nb2, pb2, rn2, &rel_now);
-            if (rel_now < 1e-3 && rn < 1e3) converged = 1;
+            double rel_now = 0.0, hid_now = 0.0;
+            residual(m, u, utmp, nb2, pb2, rn2, &rel_now, &hid_now);
+            /* hid_now：被 eq_minority 替换的行按真实方程算的最大不平衡度。
+             * 1500nm 亮态的塌缩解（吸收层全层钉扎）rel/rn 双假收敛，
+             * 但隐藏行不平衡 ~O(1)（产生率无处泄放），在这里被拦下。 */
+            if (rel_now < 1e-3 && rn < 1e3 && hid_now < 1e-2) converged = 1;
+            if (converged && getenv("PVK_DEBUG"))
+                fprintf(stderr, "[pvk] relaxed accept: rel=%.2e rn=%.2e hid=%.2e\n",
+                        rel_now, rn, hid_now);
             rel_prev2 = rel_prev;
             rel_prev = rel_now;
             if (converged) break;
@@ -1102,11 +1140,12 @@ static int solve_newton(pvk_model* m, double* u,
          * 阈值 1e-2 比上面的提前放行（1e-3）宽松：这里 Newton 已经走不动，
          * 只能确认解没有明显不平衡；正常收敛仍靠 rn<tol 或上面的 1e-3。 */
         if (alpha * dumax < 1e-7) {
-            double rel_now = 0.0;
-            residual(m, u, utmp, nb2, pb2, rn2, &rel_now);
-            converged = rel_now < 1e-2 ? 1 : 0;
+            double rel_now = 0.0, hid_now = 0.0;
+            residual(m, u, utmp, nb2, pb2, rn2, &rel_now, &hid_now);
+            converged = (rel_now < 1e-2 && hid_now < 1e-2) ? 1 : 0;
             if (!converged && getenv("PVK_DEBUG"))
-                fprintf(stderr, "[pvk] 步长停滞但 rel=%.3e，判为未收敛\n", rel_now);
+                fprintf(stderr, "[pvk] 步长停滞但 rel=%.3e hid=%.3e，判为未收敛\n",
+                        rel_now, hid_now);
             break;
         }
     }
@@ -1119,10 +1158,11 @@ static int solve_newton(pvk_model* m, double* u,
 
     /* 诊断输出：最终解的无量纲相对不平衡度（判据见循环尾部）。 */
     {
-        double rel = 1e300;
-        residual(m, u, r, nbuf, pbuf, rnet, &rel);
+        double rel = 1e300, hid = 0.0;
+        residual(m, u, r, nbuf, pbuf, rnet, &rel, &hid);
         if (getenv("PVK_DEBUG")) {
-            fprintf(stderr, "[pvk] rel_residual=%.3e (converged=%d)\n", rel, converged);
+            fprintf(stderr, "[pvk] rel_residual=%.3e hid=%.3e (converged=%d)\n",
+                    rel, hid, converged);
             if (!isfinite(rel)) {
                 for (int i2 = 0; i2 < nn; i2++) {
                     if (!isfinite(r[i2])) {
@@ -1460,7 +1500,18 @@ static void equilibrium_guess(pvk_ctx* ctx, const pvk_device* dev,
  *
  * 用平衡密度而不是当前密度：亮态下吸收层的 n 可以很高，但它不是
  * 接触层，必须保留完整的双载流子方程。走到层边界就停，避免把 ETL/HTL
- * 之外的吸收层卷进来。 */
+ * 之外的吸收层卷进来。
+ *
+ * 【已知物理后果：亮态理想因子 >2】本模型把整个简并 ETL/HTL 归入
+ * 钉扎层后，选择性提取集中在单网格节点完成，无限表面复合使钉扎区内
+ * SRH 恒为 0。Voc 处体内 SRH≈总产生仍是主导，但环流电流（=Jsc）把
+ * 吸收层边缘撕出随光强增大的 n/p 失衡（1 sun 时前端 p/n≈115），
+ * SRH=np/(τ(n+p)) 中 (n+p) 增速超过 e^(V/2Vt)，导致 dVoc/dlnG 的
+ * 表观理想因子升到 ~3（0.1–1 sun 段峰值），偏离高注入 SRH 理论值 2。
+ * 已验证与网格无关（101/1 与 201/2 差 <0.05），非串联电阻（Voc 处
+ * J=0），也非插值伪影（二分法精确求 Voc 同值）。回归锚点见
+ * python/scripts/analytic_benchmarks.py 第 7 项；是否改用有限表面
+ * 复合速度边界，待外部软件（SCAPS/Silvaco）对照后决定。 */
 static void mark_contact_layer(pvk_model* m, const double* u) {
     int n = m->n;
     memset(m->cpl, 0, sizeof(unsigned char) * (size_t)n);
@@ -1492,12 +1543,17 @@ static void mark_contact_layer(pvk_model* m, const double* u) {
     }
 
     if (getenv("PVK_DEBUG")) {
-        int c1 = 0, c2 = 0;
+        int c1 = 0, c2 = 0, k0 = -1, k1 = -1, k2 = -1, k3 = -1;
         for (int k = 0; k < n; k++) {
-            if (m->cpl[k] == 1) c1++;
-            else if (m->cpl[k] == 2) c2++;
+            if (m->cpl[k] == 1) { c1++; if (k0 < 0) k0 = k; k1 = k; }
+            else if (m->cpl[k] == 2) { c2++; if (k2 < 0) k2 = k; k3 = k; }
         }
-        fprintf(stderr, "[pvk] contact layer: cathode %d nodes, anode %d nodes\n", c1, c2);
+        fprintf(stderr, "[pvk] contact layer: cathode %d nodes (%.1f..%.1f nm, lay=%d), "
+                        "anode %d nodes (%.1f..%.1f nm, lay=%d)\n",
+                c1, k0 >= 0 ? m->x[k0]*1e7 : -1.0, k1 >= 0 ? m->x[k1]*1e7 : -1.0,
+                k0 >= 0 ? m->node_layer[k0] : -1,
+                c2, k2 >= 0 ? m->x[k2]*1e7 : -1.0, k3 >= 0 ? m->x[k3]*1e7 : -1.0,
+                k2 >= 0 ? m->node_layer[k2] : -1);
     }
 }
 
