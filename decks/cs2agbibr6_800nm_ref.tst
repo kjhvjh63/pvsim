@@ -2,14 +2,30 @@
 #
 # 参数来源：D:\王继凯毕设资料\原始数据\test0408_3D_TiO2_NiO_loop_perov.in
 # 结构：FTO 20 / TiO2 20 / Cs2AgBiBr6 800 / NiO 20 / Au 100 nm
-# 参考数据：D:\交互界面_data\datasets\jv_800nm.xlsx（Silvaco 导出）
+# 参考数据：D:\王继凯毕设资料\原始数据\钙钛矿层厚度扫描\
+#           solarex_TiO2_NiO_perov_0.8um.log（Atlas SSF，面积 1e-6 cm²）
+#           汇总：..\summary_results_TiO2_NiO_perov_scan.csv
+#           0.8 um 参考（标准 1 sun）：
+#             Jsc 27.26 / Voc 1.1821 / FF 0.809 / PCE 26.06%
+# 注意：datasets\jv_800nm.xlsx（Jsc 15.04）是另一轮数据，不要用它做基准。
+#
+# 本地 Atlas 复现（decks\atlas2d_800nm.in + scripts\atlas_reference.py）：
+#   同一结构、同材料/陷阱参数，2D 1 sun 得
+#     Jsc 27.27 / Voc 1.1822 / FF 0.810 / PCE 26.13%
+#   与上述 3D 结果四位有效数字吻合 → 参考数据确为 1 sun，可用作基准。
+#
+# 消融实验（Atlas 2D，逐项删除）：
+#   * 去 TRAP（1e14 @0.8 eV）：Voc 仅 +0.5 mV、FF +0.002 → 与寿命模型等价，
+#     本平台不必实现显式陷阱；
+#   * 去 copt=2.3e-9：Jsc 30.56 / Voc 1.2340 / FF 0.879 → 该项影响 Voc 52 mV、
+#     FF 0.069。copt 只见于 Silvaco 激光示例，疑为模板残留。
 #
 # 已知差异（对照时需记住）：
-#   * Atlas 用 index.file 的 n,k 做光学；本平台用内置 α(E) 表，Jsc 会有系统偏差；
-#   * Atlas 开了 auger + optr 与 1e14 cm^-3 体陷阱、两个界面陷阱；
-#     本平台当前只有 SRH（用 taun/taup 等效），复合会被低估；
+#   * Atlas 用 index.file 的 n,k 做光学（含亚带隙吸收，无带隙截断）；
+#     本平台同样走 nk，且此处显式关掉 bandgap.mask 以对齐 Atlas 口径；
+#   * Atlas 另有 auger(1e-32) 与两个界面陷阱，实测贡献 ≈0；
 #   * Atlas 的 gold 是 conductor；本平台按 .mat 的 AU 处理。
-# 因此这个 deck 用于"同结构、同电学参数"的基线对照，不追求逐点吻合。
+# 当前结果：Jsc 28.18 / Voc 1.2801 / FF 0.899（Jsc +3.3%、Voc +98 mV、FF +0.089）。
 
 title Cs2AgBiBr6 800nm reference cell (Silvaco replica)
 
@@ -43,7 +59,7 @@ material name=NIO eg=3.8 chi=1.46 eps=10.7 nc=2.8e19 nv=1e19 \
          mun=12 mup=2.8 taun=1e-6 taup=1e-5
 
 models srh
-optics spectrum=am15g intensity=100 bounces=1 bandgap.mask \
+optics spectrum=am15g intensity=100 bounces=1 bandgap.mask=0 \
        nk.dir="D:/交互界面_data/datasets/nk"
 
 method newton maxiter=80 tol=1e-8 damping=1.0

@@ -1,0 +1,67 @@
+# Atlas 2D 复现卡：Cs2AgBiBr6 参考电池（吸收层 800 nm）
+#
+# 用途：在本机 Silvaco Atlas 上复现参考结果，作为 csrc 的权威对照。
+# 运行：python scripts/atlas_reference.py（会自动拷贝折射率文件并调用 atlas.exe）
+#
+# 结构：FTO 20 / TiO2 20 / Cs2AgBiBr6 800 / NiO 20 nm（Au 由电极代替）
+# 材料、掺杂、迁移率、陷阱、界面陷阱、光谱全部照抄
+#   D:\王继凯毕设资料\原始数据\test0408_3D_TiO2_NiO_loop_perov.in
+#
+# 实测结果（1 sun，与 3D 原卡的 solarex_TiO2_NiO_perov_0.8um.log 吻合到四位数字）：
+#   Jsc 27.27 / Voc 1.1822 / FF 0.810 / PCE 26.13%
+#
+# 【踩过的坑】BEAM 的 min.w / max.w 是相对 x.origin 的偏移，不是绝对坐标：
+#   x.origin=5 时必须写 min.w=-5 max.w=5 才覆盖 0..10 um 的器件；
+#   写成 min.w=0 max.w=10 只有一半器件被照到，Jsource 正好是 q*Phi 的一半（QE=50%），
+#   而且这个 0.5 与波长无关，极易被误判成"2 倍光强"或"光学模型差 2 倍"。
+#   校验方法：单色 0.5 um、1 W/cm2 时 Jsource 应等于 4.033e-8 A/um（q*Phi 的 100%）。
+
+go atlas
+mesh
+x.mesh loc=0 spac=2
+x.mesh loc=10 spac=2
+y.mesh loc=-0.02 spac=0.004
+y.mesh loc=0.00 spac=0.002
+y.mesh loc=0.02 spac=0.02
+y.mesh loc=0.82 spac=0.004
+y.mesh loc=0.84 spac=0.004
+region num=1 user.material=FTO y.min=-0.02 y.max=0.00
+region num=2 user.material=titi y.min=0.00 y.max=0.02
+region num=3 user.material=Cs2AgBiBr6 y.min=0.02 y.max=0.82
+region num=4 user.material=NiO y.min=0.82 y.max=0.84
+elec num=1 name=anode x.min=0 x.max=10 y.min=-0.02 y.max=-0.02
+elec num=2 name=cathode x.min=0 x.max=10 y.min=0.84 y.max=0.84
+doping region=1 uniform conc=1.0e18 n.type
+doping region=2 uniform conc=5.06e19 n.type
+doping region=3 uniform conc=4.0e16 p.type
+doping region=4 uniform conc=1.0e18 p.type
+material material=FTO user.group=semiconductor user.default=SnO2 m.vthn=1e7 m.vthp=1e7 permittivity=9 eg300=3.5 affinity=4 nc300=2.2e18 nv300=1.8e19 taun0=1e-5 taup0=1e-6 index.file=FTO.txt
+material material=titi user.group=semiconductor user.default=TiO2 m.vthn=1e7 m.vthp=1e7 permittivity=100 eg300=3.2 affinity=4 nc300=2e20 nv300=1e21 taun0=1e-6 taup0=1e-5 index.file=TiO2.txt
+material material=Cs2AgBiBr6 user.group=semiconductor user.default=GaAs permittivity=5.8 eg300=1.61 affinity=3.72 nc300=2e18 nv300=1e19 taun0=6.6e-7 taup0=6.6e-7 augn=1.0e-32 augp=1.0e-32 copt=2.3e-9 index.file=Cs2AgBiBr6_nk_wavelength.txt
+material material=NiO user.group=semiconductor user.default=ZnO permittivity=10.7 eg300=3.8 affinity=1.46 nc300=2.8e19 nv300=1e19 taup0=1e-5 taun0=1e-6 index.file=NiO.txt
+mobility material=FTO mun=20 mup=10
+mobility material=Cs2AgBiBr6 mun=9.28 mup=9.28
+mobility material=titi mun=6e-3 mup=6e-3
+mobility material=NiO mun=12 mup=2.8
+TRAP MATERIAL=Cs2AgBiBr6 ACCEPTOR E.LEVEL=0.8 DENSITY=1e14 SIGN=1e-15 SIGP=1e-15 DEGEN.FAC=1
+TRAP MATERIAL=FTO ACCEPTOR E.LEVEL=1.75 DENSITY=1e15 SIGN=1e-15 SIGP=1e-15 DEGEN.FAC=1
+TRAP MATERIAL=NiO ACCEPTOR E.LEVEL=1.9 DENSITY=1e14 SIGN=1e-15 SIGP=1e-15 DEGEN.FAC=1
+INTTRAP Y.MIN=0.02 Y.MAX=0.02 E.LEVEL=0.827 DENSITY=1e10 SIGN=1e-17 SIGP=1e-18 ACCEPTOR DEGEN.FAC=1
+INTTRAP Y.MIN=0.82 Y.MAX=0.82 E.LEVEL=0.827 DENSITY=1e10 SIGN=1e-18 SIGP=1e-19 ACCEPTOR DEGEN.FAC=1
+models srh auger optr
+
+# 1 sun：AM15.spec 第二列单位是 W/cm2/um，Atlas 读出 Isampled=0.1000372 W/cm2
+beam num=1 x.origin=5 y.origin=-0.5 angle=90 power.file=AM15.spec min.w=-5 max.w=5
+
+solve init
+solve previous
+solve b1=1
+
+log outf=atlas2d_800nm.log
+solve vcathode=0 vstep=0.02 vfinal=2 name=cathode
+log off
+
+extract name="Voc" x.val from curve(v."cathode", i."anode") where y.val=0.0
+extract name="Isc" y.val from curve(v."cathode", i."anode") where x.val=0.0
+extract name="Pm" max(curve(v."cathode", (v."cathode" * i."anode")))
+quit
