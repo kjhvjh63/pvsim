@@ -40,12 +40,11 @@ jobs:
             [ "$f" = "python/tests/test_gui.py" ] && continue
             echo "== $f"
             if ! python "$f" > test.log 2>&1; then
-              # 把日志尾部放进单条注解（%0A 编码换行），避免注解条数上限
-              python - "$f" <<'PY'
-import pathlib, sys, urllib.parse
-tail = "\n".join(pathlib.Path("test.log").read_text(errors="replace").splitlines()[-16:])
-print("::error::" + urllib.parse.quote(sys.argv[1] + ":\n" + tail))
-PY
+              tail -n 20 test.log
+              grep -m3 -E "FAIL|Traceback|ModuleNotFoundError|ImportError" test.log \
+                | while IFS= read -r line; do
+                    echo "::error::${line//%/%25}"
+                  done
               exit 1
             fi
             tail -n 2 test.log
