@@ -7,6 +7,13 @@
   4. Jsc 与光强近似线性（50/100 mW/cm² 之比与 2 的偏差 < 3%）
   5. 吸收层内总电流守恒：JTOTAL 沿 x 的展布 < 1e-3
   6. 暗态零偏无净电流：|J(0)| < 1e-8 mA/cm²
+  7. 亮态 Voc 光照斜率锚点：0.3→1 sun 的 dVoc/dlnG/Vt 应落在 2.5–3.6。
+     注意：单能级 SRH 高注入的理论斜率是 2，实测 >2 是 A′ 接触模型
+     （整个 ETL/HTL 归入钉扎层、无限表面复合）的固有后果——Voc 处
+     环流电流（=Jsc）把吸收层边缘撕出随光强增大的 n/p 失衡，
+     SRH=np/(τ(n+p)) 中 (n+p) 增速超过 e^(V/2Vt)，压低了 SRH 随 V
+     的增速。已排除网格伪影（201/2 同值）与串联电阻（Voc 处 J=0）。
+     此锚点只防行为回退，不代表物理正确；待外部软件对照后再定取舍。
 
 --export DIR 会把 1 sun 的 J-V 写成 SSF/.log（DeckBuild 可直接打开），
 用于和 SCAPS / Silvaco 等外部结果逐点对照。
@@ -119,6 +126,11 @@ def main() -> int:
     zero = run(intensity=0.0, v0=0.0, v1=0.0, npts=1)
     j0 = zero.points[0].J_mA_cm2
     check("|J(0)| < 1e-8 mA/cm²", abs(j0) < 1e-8, f"J={j0:.3e}")
+
+    print("7. 亮态 Voc 光照斜率锚点（A′ 接触固有 n>2，见模块文档）")
+    third = run(intensity=30.0)
+    n_light = (sun.jv.Voc - third.jv.Voc) / np.log(100.0 / 30.0) / Vt
+    check("2.5 ≤ n_light ≤ 3.6", 2.5 <= n_light <= 3.6, f"n_light={n_light:.3f}")
 
     print("\n参考曲线（供外部对照）")
     for inten in (10.0, 50.0, 100.0):
