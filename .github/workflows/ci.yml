@@ -40,11 +40,12 @@ jobs:
             [ "$f" = "python/tests/test_gui.py" ] && continue
             echo "== $f"
             if ! python "$f" > test.log 2>&1; then
-              # 失败时把 FAIL / Traceback 行变成注解，便于通过 API 定位
-              grep -E "FAIL|Traceback|Error" test.log | head -n 20 | while IFS= read -r line; do
-                echo "::error::${f}: ${line//%/%25}"
-              done
-              tail -n 40 test.log
+              # 把日志尾部放进单条注解（%0A 编码换行），避免注解条数上限
+              python - "$f" <<'PY'
+import pathlib, sys, urllib.parse
+tail = "\n".join(pathlib.Path("test.log").read_text(errors="replace").splitlines()[-16:])
+print("::error::" + urllib.parse.quote(sys.argv[1] + ":\n" + tail))
+PY
               exit 1
             fi
             tail -n 2 test.log
