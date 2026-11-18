@@ -38,6 +38,14 @@ def section(title):
     print(f"\n=== {title} ===")
 
 
+def _try(fn, exc):
+    try:
+        fn()
+    except exc as e:
+        return e
+    return None
+
+
 def make_result(run_id="runA", n_pts=5, n_node=10):
     """构造一个不依赖内核的 SimResult。"""
     spec = default_problem_spec()
@@ -299,6 +307,137 @@ with tempfile.TemporaryDirectory() as tmp:
     csv_path = write_jv_csv(csv_jv, Path(tmp) / "jv.csv")
     check("write_jv_csv 落盘", csv_path.exists())
     check("CSV 往返一致", csv_path.read_text(encoding="utf-8") == csv_text)
+
+
+# ---------------------------------------------------------------------------
+# 10. 外部对照（SCAPS / Silvaco 参考曲线）
+# ---------------------------------------------------------------------------
+
+section("10. external reference compare")
+
+from pvsim.dataio import compare, load_reference
+from pvsim.dataio.reference import read_text_curve
+from pvsim.dataio import SilvacoLogWriter
+
+REF_V = np.linspace(0.0, 1.0, 11)
+REF_J = -22.0 + 22.0 * (np.exp(REF_V / 0.05) - 1.0) / (np.exp(20.0) - 1.0)
+
+with tempfile.TemporaryDirectory() as tmp:
+    tmp = Path(tmp)
+
+    # 有表头的 CSV（SCAPS 常见导出）
+    csv_ref = tmp / "scaps.iv"
+    rows = ["# SCAPS-1D J-V export", "V (V)\tJ (mA/cm2)\tP"]
+    for v, j in zip(REF_V, -REF_J):          # 参考惯例：短路电流为正
+        rows.append(f"{v:.6f}\t{j:.6f}\t{-j * v:.6f}")
+    csv_ref.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    V_csv, J_csv, header = read_text_curve(csv_ref)
+    check("文本表头识别", header[0].startswith("V") and len(header) == 3,
+          str(header))
+    check("文本读数点数", V_csv.size == REF_V.size, str(V_csv.size))
+
+    jv_ref = load_reference(csv_ref)
+    check("参考曲线已归一为内核惯例（指标为正）",
+          jv_ref.Jsc > 0 and abs(jv_ref.Jsc - 22.0) < 0.2, f"{jv_ref.Jsc:.4f}")
+
+    # 无表头、短路为负（已是内核惯例）→ 保持不变
+    plain = tmp / "atlas.dat"
+    plain.write_text("\n".join(f"{v:.6f} {j:.6f}"
+                               for v, j in zip(REF_V, REF_J)) + "\n",
+                     encoding="utf-8")
+    jv_plain = load_reference(plain)
+    check("无表头文件自动识别惯例",
+          abs(jv_plain.Jsc - 22.0) < 0.2, f"{jv_plain.Jsc:.4f}")
+
+    # SSF 往返：写出去的 .log 能被 load_reference 读回同一曲线
+    sim_like = JVData.from_points(REF_V, REF_J, 100.0)
+    log_path = SilvacoLogWriter().write(sim_like, tmp / "sim.log")
+    jv_log = load_reference(log_path)
+    check("SSF 参考读回 Jsc", abs(jv_log.Jsc - 22.0) < 0.2,
+          f"{jv_log.Jsc:.4f}")
+
+    # 完全一致 → 全部通过
+    rep = compare(sim_like, load_reference(csv_ref))
+    check("完全一致时通过", rep.passed, "\n".join(rep.lines()))
+    check("完全一致时 RMSE≈0", rep.rmse_mA_cm2 < 1e-6,
+          f"{rep.rmse_mA_cm2:g}")
+    check("公共区间覆盖 0→1 V",
+          abs(rep.v_window[0]) < 1e-12 and abs(rep.v_window[1] - 1.0) < 1e-12,
+          str(rep.v_window))
+
+    # Jsc 偏 10% → Jsc 项应判超差
+    worse = JVData.from_points(REF_V, REF_J * 1.10, 100.0)
+    rep_bad = compare(worse, load_reference(csv_ref))
+    jsc_metric = next(m for m in rep_bad.metrics if m.name == "Jsc")
+    check("Jsc 偏 10% 判超差", not jsc_metric.ok and not rep_bad.passed,
+          jsc_metric.line())
+
+    # 区间不重叠 → 明确报错
+    far = JVData.from_points(REF_V + 5.0, REF_J, 100.0)
+    check("无重叠区间抛 ValueError",
+          isinstance(_try(lambda: compare(far, load_reference(csv_ref)),
+                          ValueError), ValueError))
+
+
+# ---------------------------------------------------------------------------
+# 11. SCAPS 对照材料导出
+# ---------------------------------------------------------------------------
+
+section("11. scaps export")
+
+from pvsim.dataio import export_scaps, layers_of, parameter_table, scaps_script
+from pvsim.script import DeckCompiler
+
+SCAPS_DECK = (
+    "region material=FTO thickness=200\n"
+    "region material=MAPbI3 thickness=500\n"
+    "region material=Au thickness=80\n"
+    "doping region=1 n.type conc=1e20\n"
+    "doping region=3 p.type conc=1e20\n"
+    "solve vstart=0 vfinal=1.5 vstep=0.05\n"
+)
+scaps_spec = DeckCompiler().compile_text(SCAPS_DECK)
+scaps_layers = layers_of(scaps_spec)
+
+check("SCAPS 层数 = deck 层数", len(scaps_layers) == 3, str(len(scaps_layers)))
+check("厚度换算成 µm", scaps_layers[1].thickness_um == 0.5,
+      str(scaps_layers[1].thickness_um))
+check("首末层标记为接触层",
+      scaps_layers[0].is_contact and scaps_layers[-1].is_contact
+      and not scaps_layers[1].is_contact)
+check("吸收层参数带过来",
+      scaps_layers[1].Eg_eV == 1.6 and scaps_layers[1].taun_s == 8e-9,
+      f"{scaps_layers[1].Eg_eV} / {scaps_layers[1].taun_s}")
+
+script_text = scaps_script(scaps_spec, iv_name="demo")
+check("脚本含温度", "action workingpoint.temperature 300" in script_text)
+check("脚本含光照", "action light" in script_text)
+check("脚本 IV 区间来自 deck",
+      "action iv.startV 0" in script_text and "action iv.stopV 1.5" in script_text,
+      script_text)
+check("脚本点数来自 deck", "action iv.points 31" in script_text)
+check("脚本保存 .iv", "save results.iv demo" in script_text)
+check("脚本只用已验证命令",
+      all(line.startswith(("//", "action ", "save ", ""))
+          for line in script_text.splitlines()),
+      script_text)
+
+table_text = parameter_table(scaps_spec, iv_name="demo")
+check("清单含每层材料",
+      all(l.material in table_text for l in scaps_layers))
+check("清单含已验证的层命令",
+      "set layer2.thickness 0.5" in table_text
+      and "set layer2.Eg" in table_text and "set layer2.epsilon" in table_text,
+      table_text[:200])
+check("清单说明总层数与半导体层数", "层数：3" in table_text)
+
+with tempfile.TemporaryDirectory() as tmp:
+    sp, tp = export_scaps(scaps_spec, tmp, iv_name="demo")
+    check("导出脚本文件", Path(sp).exists() and Path(sp).name == "demo.script")
+    check("导出参数清单", Path(tp).exists() and Path(tp).name == "demo_scaps_params.md")
+    check("导出内容与函数一致",
+          Path(sp).read_text(encoding="utf-8") == script_text)
 
 
 # ---------------------------------------------------------------------------

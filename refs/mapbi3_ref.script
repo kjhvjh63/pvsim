@@ -1,0 +1,15 @@
+// pvsim -> SCAPS-1D 对照脚本
+// 用法：GUI 里按同名 .md 清单建好层栈/掺杂/缺陷后，本脚本负责
+//      按与 pvsim 相同的温度、光照、电压范围跑 IV 并存 .iv。
+// pvsim deck 的入射功率 = 100 mW/cm²，
+// 请确认 SCAPS 的 Spectrum 面板为 AM1.5G、对应积分功率一致。
+
+action workingpoint.temperature 300
+action light
+
+action iv.startV 0
+action iv.stopV 1.8
+action iv.points 37
+action iv.doiv
+
+save results.iv mapbi3_ref
