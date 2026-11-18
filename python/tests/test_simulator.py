@@ -81,6 +81,23 @@ jv4 = JVData.from_points(V=[1.5, 0.0, 1.0, 0.5],
 check("乱序 V 仍得 Voc=1.25", abs(jv4.Voc - 1.25) < 1e-12, f"got {jv4.Voc}")
 check("summary 可读", "Jsc=20" in jv.summary(), jv.summary())
 
+# 断档保护：Voc 附近有未收敛点、两侧收敛点相隔 >2 个步长 → 不许插值
+jv_gap = JVData.from_points(
+    V=[0.0, 1.30, 1.32, 1.34, 1.36, 1.38, 1.40, 1.44],
+    J=[-20.0, -10.0, -5.3, -5.3, -5.3, -5.3, -5.3, 174.0],
+    pin_mW_cm2=100.0,
+    converged=[True, True, True, False, False, False, False, True])
+check("过零断档（跨 6 步）→ Voc NaN", math.isnan(jv_gap.Voc), f"got {jv_gap.Voc}")
+check("过零断档 → FF NaN", math.isnan(jv_gap.FF))
+check("过零断档 → Jsc 仍按收敛点算", abs(jv_gap.Jsc - 20.0) < 1e-12, f"got {jv_gap.Jsc}")
+
+# 相邻收敛点（间隔 1 个步长）照常插值
+jv_ok = JVData.from_points(V=[0.0, 1.30, 1.32, 1.34],
+                           J=[-20.0, -10.0, -5.0, 5.0],
+                           pin_mW_cm2=100.0,
+                           converged=[True, True, True, True])
+check("收敛点相邻仍得 Voc=1.33", abs(jv_ok.Voc - 1.33) < 1e-12, f"got {jv_ok.Voc}")
+
 
 # ---------------------------------------------------------------------------
 # 2. Simulator.run 真实内核

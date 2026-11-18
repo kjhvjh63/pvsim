@@ -226,6 +226,7 @@ class ResultStore:
             [p.V for p in points],
             [p.J_mA_cm2 for p in points],
             pin_mW_cm2=spec.optics.intensity_mW_cm2,
+            converged=[p.converged for p in points],
         )
 
         return SimResult(

@@ -128,6 +128,8 @@ class JVData:
     功率 ``P = -J·V``。
 
     过零缺失（例如全零场、或者扫描没覆盖到 Voc）时 ``Voc = nan``；
+    过零点两侧的收敛点相距超过 2 个网格步长时也报 ``nan``（断档保护：
+    中间隔着未收敛点时，跨档插值会给出貌似合理的伪 Voc）；
     ``Voc`` 或 ``Jsc`` 非正时 ``FF = nan``；``Pmax <= 0`` 时
     ``PCE = nan``。绝不拿扫描终点冒充 Voc。
     """
@@ -143,7 +145,8 @@ class JVData:
 
     @classmethod
     def from_points(cls, V: Sequence[float], J: Sequence[float],
-                    pin_mW_cm2: float) -> "JVData":
+                    pin_mW_cm2: float,
+                    converged: Optional[Sequence[bool]] = None) -> "JVData":
         Varr = np.asarray(V, dtype=float).ravel()
         Jarr = np.asarray(J, dtype=float).ravel()
         nan = float("nan")
@@ -154,28 +157,49 @@ class JVData:
 
         order = np.argsort(Varr)
         Vs, Js = Varr[order], Jarr[order]
+        if converged is None:
+            ok = np.ones(Vs.size, dtype=bool)
+        else:
+            ok = np.asarray(converged, dtype=bool).ravel()[order]
+            if ok.size != Vs.size:
+                ok = np.ones(Vs.size, dtype=bool)
+
+        # 只认收敛点：未收敛点带的是上一个收敛点的冻结 J，放到它自己的
+        # 偏压上会把曲线抹平（扫描在 Voc 附近断档时尤其致命）。
+        Vc, Jc = Vs[ok], Js[ok]
 
         # Jsc：V=0 处线性插值，取 −J
-        if Vs[0] <= 0.0 <= Vs[-1]:
-            j0 = float(np.interp(0.0, Vs, Js))
+        if Vc.size >= 2 and Vc[0] <= 0.0 <= Vc[-1]:
+            j0 = float(np.interp(0.0, Vc, Jc))
+        elif Vc.size > 0:
+            j0 = float(Jc[int(np.argmin(np.abs(Vc)))])
         else:
-            j0 = float(Js[int(np.argmin(np.abs(Vs)))])
-        Jsc = 0.0 if j0 == 0.0 else -j0   # 避免 -0.0 影响显示
+            j0 = nan
+        Jsc = (0.0 if j0 == 0.0 else -j0) if math.isfinite(j0) else nan
 
-        # Voc：J 由负穿越到正的第一个交点（线性插值）
+        # Voc：J 由负穿越到正的第一个交点（线性插值）。
+        # 断档保护：跨点间距超过 2 个网格步长时不插值。扫描在 Voc 附近
+        # 有未收敛点、隔了几个点才又收敛时，跨档直线会给一个貌似合理的
+        # 伪 Voc（例如 -5 mA@1.32 V 直接连 +174 mA@1.44 V，插出 1.42 V）。
+        dV = np.diff(Vs)
+        step = float(np.median(dV)) if dV.size else 0.0
         Voc = nan
-        for i in range(Vs.size - 1):
-            if Js[i] < 0.0 <= Js[i + 1]:
-                d = Js[i + 1] - Js[i]
-                t = (-Js[i] / d) if d != 0.0 else 0.5
-                Voc = float(Vs[i] + t * (Vs[i + 1] - Vs[i]))
+        for i in range(Vc.size - 1):
+            if not (Jc[i] < 0.0 <= Jc[i + 1]):
+                continue
+            gap = Vc[i + 1] - Vc[i]
+            if step > 0.0 and gap > 2.0 * step * (1.0 + 1e-9):
                 break
+            d = Jc[i + 1] - Jc[i]
+            t = (-Jc[i] / d) if d != 0.0 else 0.5
+            Voc = float(Vc[i] + t * gap)
+            break
 
-        # Pmax：只在 V>0 区取 -J·V 的最大值
+        # Pmax：只在 V>0 且收敛的点上取 -J·V 的最大值
         Pmax = nan
-        mask = Vs > 0.0
+        mask = (Vc > 0.0)
         if np.any(mask):
-            Pmax = float(np.max(-Js[mask] * Vs[mask]))
+            Pmax = float(np.max(-Jc[mask] * Vc[mask]))
 
         FF = nan
         if (math.isfinite(Voc) and Voc > 0.0
@@ -323,7 +347,8 @@ class Simulator:
             self.lib.destroy(ctx)
 
         jv = JVData.from_points(v_grid, [p.J_mA_cm2 for p in points],
-                                pin_mW_cm2=spec.optics.intensity_mW_cm2)
+                                pin_mW_cm2=spec.optics.intensity_mW_cm2,
+                                converged=[p.converged for p in points])
         rid = run_id or f"{spec.output.run_name}_{datetime.now():%Y%m%d_%H%M%S}"
         result = SimResult(
             run_id=rid,
