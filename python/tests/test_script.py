@@ -321,6 +321,20 @@ DeckCompiler(log=save_msgs.append).compile_text("save outfile=out/a.str\n" + MIN
 check("save 提示由 dataio 负责", any("save" in m for m in save_msgs),
       str(save_msgs))
 
+inline = DeckCompiler().compile_text(
+    "region material=FTO thickness=20\n"
+    "region material=Cs2AgBiBr6 thickness=100\n"
+    "region material=Au thickness=80\n"
+    "material name=Cs2AgBiBr6 eg=1.61 chi=3.72 eps=5.8 nc=2e18 nv=1e19 \\\n"
+    "         mun=9.28 mup=9.28 taun=6.6e-7 taup=6.6e-7\n")
+check("未知材料可用 material name= 内联完整定义",
+      inline.device.layers[1].Eg_eV == 1.61
+      and inline.device.layers[1].eps_r == 5.8,
+      f"Eg={inline.device.layers[1].Eg_eV}")
+check("内联定义带入迁移率与寿命",
+      inline.device.layers[1].mun_cm2Vs == 9.28
+      and inline.device.layers[1].taun_s == 6.6e-7)
+
 TWO_SAME = ("region material=FTO thickness=100\n"
             "region material=MAPbI3 thickness=200\n"
             "region material=MAPbI3 thickness=300\n"

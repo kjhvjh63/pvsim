@@ -222,11 +222,17 @@ class DeckCompiler:
             key = region.material.upper()
             params = self._lookup(key)
             if not params:
-                raise SpecError(
-                    f"未知材料 '{region.material}'（region[{num}]）",
-                    details=[f"内建材料：{', '.join(sorted(BUILTIN_MATERIALS))}",
-                             "或在 deck 里用 material name=... eg=... 显式给参数"],
-                )
+                # Atlas 允许在 deck 里用 material name=X ... 直接定义新材料；
+                # 只要给了参数，就当作完整定义，不必先进材料库。
+                inline = overrides.get(key)
+                if inline:
+                    params = dict(inline)
+                else:
+                    raise SpecError(
+                        f"未知材料 '{region.material}'（region[{num}]）",
+                        details=[f"内建材料：{', '.join(sorted(BUILTIN_MATERIALS))}",
+                                 "或在 deck 里用 material name=... eg=... 显式给参数"],
+                    )
             params.update(overrides.get(key, {}))
             if num in region_overrides:     # Atlas material region=N：仅覆盖本层
                 params.update(region_overrides[num])

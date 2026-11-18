@@ -441,6 +441,62 @@ with tempfile.TemporaryDirectory() as tmp:
 
 
 # ---------------------------------------------------------------------------
+# 12. Silvaco 真实导出格式（EXPORTED XY-GRAPH / xlsx）
+# ---------------------------------------------------------------------------
+
+section("12. silvaco raw exports")
+
+from pvsim.dataio.reference import read_silvaco_xy, read_xlsx_curve
+
+xy_text = (
+    "EXPORTED\tXY-GRAPH\tDATA\t\t10000000000\n"
+    "4\t2\t2\t\t\n"
+    "Anode\tCurrent\t\t\t\n"
+    "Cathode\tVoltage\t\t\t\n"
+    "15.04\t0.00E+00\t0\t\n"
+    "12.00\t0.50E+00\t1\t\n"
+    "6.00\t1.00E+00\t2\t\n"
+    "0.00\t1.40E+00\t3\t\n"
+)
+with tempfile.TemporaryDirectory() as tmp:
+    xy_path = Path(tmp) / "ref.dat"
+    xy_path.write_text(xy_text, encoding="utf-8")
+    V_xy, J_xy, head_xy = read_silvaco_xy(xy_path)
+    check("XY-GRAPH 列名识别", head_xy == ("Anode Current", "Cathode Voltage"),
+          str(head_xy))
+    check("XY-GRAPH 自动纠正列序（电流在前）",
+          np.allclose(V_xy, [0.0, 0.5, 1.0, 1.4]) and np.allclose(J_xy, [15.04, 12, 6, 0]),
+          f"V={V_xy}, J={J_xy}")
+
+    jv_xy = load_reference(xy_path)
+    check("XY-GRAPH 读入后短路为负（内核惯例）",
+          jv_xy.Jsc > 0 and abs(jv_xy.Jsc - 15.04) < 1e-6, f"{jv_xy.Jsc}")
+
+    # xlsx：表头挑 Current Density 与 Voltage（openpyxl 缺失时跳过）
+    try:
+        import openpyxl
+    except ImportError:                          # pragma: no cover
+        print("  ⏭ skip xlsx：未安装 openpyxl")
+    else:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["Anode Current (A)", "Cathode Voltage (V)",
+                   "Current Density (mA/cm^2)", "Power (W)"])
+        for v, j in ((0.0, 15.04), (0.5, 12.0), (1.0, 6.0), (1.4, 0.0)):
+            ws.append([j * 1e-4, v, j, 0.0])
+        xlsx_path = Path(tmp) / "ref.xlsx"
+        wb.save(xlsx_path)
+        wb.close()
+
+        V_x, J_x, head_x = read_xlsx_curve(xlsx_path)
+        check("xlsx 按表头挑列",
+              np.allclose(V_x, [0.0, 0.5, 1.0, 1.4]) and np.allclose(J_x, [15.04, 12, 6, 0]),
+              f"V={V_x}, J={J_x}")
+        jv_x = load_reference(xlsx_path)
+        check("xlsx 读入后短路为负（内核惯例）", jv_x.Jsc > 0 and abs(jv_x.Jsc - 15.04) < 1e-6)
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 

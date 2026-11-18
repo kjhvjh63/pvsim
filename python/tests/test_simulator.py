@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import sys
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 
@@ -281,8 +282,24 @@ check("FF 网格差 < 0.003", d_ff < 3e-3, f"{d_ff:.2e}")
 
 
 # ---------------------------------------------------------------------------
-# Summary
+# 9. nk 光学：α = 4πk/λ（k=0 应不产生光生载流子）
 # ---------------------------------------------------------------------------
+
+section("9. nk optics")
+
+with tempfile.TemporaryDirectory() as tmp:
+    nk_dir = Path(tmp)
+    # MAPbI3 的 k 全为 0 → 吸收层不吸光；FTO 给个折射率供前表面反射
+    (nk_dir / "MAPbI3.txt").write_text(
+        "3\n0.3 2.5 0\n0.8 2.3 0\n1.2 2.2 0\n", encoding="utf-8")
+    (nk_dir / "FTO.txt").write_text(
+        "3\n0.3 1.9 0\n0.8 1.8 0\n1.2 1.7 0\n", encoding="utf-8")
+    spec_nk = replace(spec, optics=replace(spec.optics, nk_dir=str(nk_dir)))
+    res_nk = Simulator().run(spec_nk)
+    check("k=0 时 Jsc 接近 0", abs(res_nk.jv.Jsc) < 0.5, f"Jsc={res_nk.jv.Jsc}")
+
+
+
 
 print(f"\n{'='*50}")
 print(f"  {passed} passed, {failed} failed, {passed+failed} total")

@@ -38,6 +38,7 @@ from ..solver.simulator import JVData
 from .silvaco_log import SilvacoLogReader
 
 _SSF_SUFFIXES = (".log", ".ssf")
+_XLSX_SUFFIXES = (".xlsx", ".xlsm")
 _SPLIT_RE = re.compile(r"[,\s;]+")
 
 
@@ -59,6 +60,116 @@ def _pick_column(header: Sequence[str], hints: Sequence[str],
         if any(h in low for h in hints):
             return i
     return default
+
+
+def read_silvaco_xy(path: Path) -> Tuple[np.ndarray, np.ndarray, Tuple[str, ...]]:
+    """读 TonyPlot ``EXPORTED XY-GRAPH DATA``；列序常是「电流在前、电压在后」。
+
+    头部形如::
+
+        EXPORTED  XY-GRAPH  DATA
+        41  2  2
+        Anode   Current
+        Cathode Voltage
+        <npoints 行数值>
+    """
+    p = Path(path)
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    idx = 0
+    if not lines or "EXPORTED" not in lines[0]:
+        raise ValueError(f"{p}: 不是 EXPORTED XY-GRAPH DATA 格式")
+
+    # 计数行：跳过空行后第一行是 "npoints ncols [ncurves]"
+    idx = 1
+    while idx < len(lines) and not lines[idx].strip():
+        idx += 1
+    counts = lines[idx].split()
+    try:
+        n_points, n_cols = int(counts[0]), int(counts[1])
+    except (IndexError, ValueError):
+        raise ValueError(f"{p}: 头部计数行无法解析：{lines[idx]!r}") from None
+    idx += 1
+
+    names: List[str] = []
+    for _ in range(n_cols):
+        if idx >= len(lines):
+            raise ValueError(f"{p}: 列名行不足 {n_cols} 行")
+        names.append(" ".join(lines[idx].split()))
+        idx += 1
+
+    rows: List[List[float]] = []
+    while idx < len(lines) and len(rows) < n_points:
+        toks = lines[idx].split()
+        idx += 1
+        if not toks:
+            continue
+        vals: List[float] = []
+        for tok in toks[:n_cols]:
+            val = _parse_float(tok)
+            if val is None:
+                vals = []
+                break
+            vals.append(val)
+        if len(vals) == n_cols:
+            rows.append(vals)
+    if len(rows) < 2:
+        raise ValueError(f"{p}: 数值行不足 2 行")
+
+    arr = np.asarray(rows, dtype=float)
+    header = tuple(names)
+    vi = _pick_column(header, ("volt", "bias"), 1)
+    ji = _pick_column(header, ("curr", "dens"), 0)
+    if vi == ji:
+        vi, ji = 1, 0
+    return arr[:, vi], arr[:, ji], header
+
+
+def read_xlsx_curve(path: Path) -> Tuple[np.ndarray, np.ndarray, Tuple[str, ...]]:
+    """读 Excel J-V：按表头找电压列与电流密度列（A 列会要求面积换算）。"""
+    try:
+        import openpyxl
+    except ImportError as exc:                      # pragma: no cover - 依赖缺失
+        raise RuntimeError("读取 .xlsx 需要 openpyxl（pip install openpyxl）") from exc
+
+    p = Path(path)
+    wb = openpyxl.load_workbook(p, read_only=True, data_only=True)
+    try:
+        ws = wb.worksheets[0]
+        it = ws.iter_rows(values_only=True)
+        header = None
+        for row in it:
+            if row and any(isinstance(c, str) for c in row):
+                header = tuple(str(c) if c is not None else "" for c in row)
+                break
+        if header is None:
+            raise ValueError(f"{p}: 没找到表头行")
+
+        vi = _pick_column(header, ("voltage",), -1)
+        # 优先电流密度（mA/cm²），其次电流（A，需要面积，直接报错更诚实）
+        ji = _pick_column(header, ("current density",), -1)
+        if ji < 0:
+            ji = _pick_column(header, ("current",), -1)
+            if ji >= 0:
+                raise ValueError(
+                    f"{p}: 只有电流(A)列，缺电流密度；请在 header 含 "
+                    f"'Current Density (mA/cm^2)'，或用 compare_reference --area 换算")
+        if vi < 0 or ji < 0:
+            raise ValueError(f"{p}: 表头里找不到电压/电流列：{header}")
+
+        rows = []
+        for row in it:
+            if row is None or len(row) <= max(vi, ji):
+                continue
+            v, j = row[vi], row[ji]
+            if isinstance(v, (int, float)) and isinstance(j, (int, float)):
+                rows.append((float(v), float(j)))
+    finally:
+        wb.close()
+
+    if len(rows) < 2:
+        raise ValueError(f"{p}: 数值行不足 2 行")
+    arr = np.asarray(rows, dtype=float)
+    return arr[:, 0], arr[:, 1], header
 
 
 def read_text_curve(path: Path) -> Tuple[np.ndarray, np.ndarray, Tuple[str, ...]]:
@@ -127,7 +238,15 @@ def load_reference(path: Path, *, pin_mW_cm2: float = 100.0) -> JVData:
             jv = JVData.from_points(jv.V, -jv.J, pin_mW_cm2)
         return jv
 
-    V, J, _ = read_text_curve(p)
+    suffix = p.suffix.lower()
+    if suffix in _XLSX_SUFFIXES:
+        V, J, _ = read_xlsx_curve(p)
+    else:
+        head = p.read_text(encoding="utf-8", errors="replace").lstrip()
+        if head.startswith("EXPORTED"):
+            V, J, _ = read_silvaco_xy(p)
+        else:
+            V, J, _ = read_text_curve(p)
     if _short_circuit_current(V, J) > 0:
         J = -J                                   # 交付惯例 → 内核惯例
     return JVData.from_points(V, J, pin_mW_cm2)
