@@ -22,8 +22,15 @@ jobs:
 
       - name: 构建 C 内核
         run: |
+          set -o pipefail
           cmake -S csrc -B csrc/build -DCMAKE_BUILD_TYPE=Release
-          cmake --build csrc/build -j"$(nproc)"
+          # 失败时把日志尾部变成注解，便于在 API/网页上直接定位
+          if ! cmake --build csrc/build -j"$(nproc)" > build.log 2>&1; then
+            tail -n 30 build.log | while IFS= read -r line; do
+              echo "::error::${line//%/%25}"
+            done
+            exit 1
+          fi
 
       - name: 单元测试
         env:
