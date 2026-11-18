@@ -46,6 +46,10 @@ set_target_properties(pvk PROPERTIES
 if(WIN32)
     target_compile_definitions(pvk PRIVATE PVK_BUILDING)
     target_compile_options(pvk PRIVATE -Wall -Wextra)
+else()
+    # POSIX 下 log/exp/pow 等不在 libc 里，必须显式链接 libm，
+    # 否则 libpvk.so 会留下未定义符号，链接测试程序时 collect2 失败。
+    target_link_libraries(pvk PRIVATE m)
 endif()
 
 # ─────────────────────────────────────────────────────────────────────
