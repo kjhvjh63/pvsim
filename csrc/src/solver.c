@@ -392,6 +392,85 @@ static double residual(const pvk_model* m, const double* u, double* r,
 }
 
 /* ─────────────────────────────────────────────────────────────────────
+ * 局部残差（单节点三行）
+ *
+ * 数值雅可比只需要被扰动节点 ±1 的残差行，但 residual() 每次都扫全器件
+ * （O(n)），3n 列的代价就是 O(n²)。这里把单节点的三行公式抽出来，
+ * 配合预计算的 nbuf/pbuf/rnet 复用，使整块雅可比的代价降到 O(n)。
+ * 公式必须与 residual() 逐项一致（含 bc / 接触层 / 少子退化分支）。
+ * ───────────────────────────────────────────────────────────────────── */
+static void residual_local(const pvk_model* m, const double* u, int i,
+                           const double* nbuf, const double* pbuf,
+                           const double* rnet, double out[3]) {
+    const int n = m->n;
+
+    if (m->bc[i]) {
+        int e = m->bc[i] - 1;
+        out[0] = u[i]         - m->u_bc[e];
+        out[1] = u[n + i]     - m->wn_bc[e];
+        out[2] = u[2 * n + i] - m->wp_bc[e];
+        return;
+    }
+
+    double hL = m->h[i-1];
+    double hR = m->h[i];
+    double hc = m->hc[i];
+
+    double fluxR = m->eps[i+1] * (u[i+1] - u[i]) * m->Vt / hR;
+    double fluxL = m->eps[i]   * (u[i]   - u[i-1]) * m->Vt / hL;
+    double fterm = (fluxR - fluxL) / (PVK_Q_C * hc);
+    out[0] = fterm + (pbuf[i] - nbuf[i] + m->Nd[i] - m->Na[i]);
+
+    if (m->cpl[i]) {
+        int e = m->cpl[i] - 1;
+        out[1] = u[n + i]     - m->wn_bc[e];
+        out[2] = u[2 * n + i] - m->wp_bc[e];
+        return;
+    }
+
+    double duR = u[i+1] - u[i];
+    double duL = u[i]   - u[i-1];
+    double dnR = duR + (m->chis[i+1] - m->chis[i]) + log(m->Nc[i+1] / m->Nc[i]);
+    double dnL = duL + (m->chis[i]   - m->chis[i-1]) + log(m->Nc[i] / m->Nc[i-1]);
+    double dpR = duR + (m->chis[i+1] - m->chis[i])
+                 + (m->egs[i+1] - m->egs[i]) + log(m->Nv[i] / m->Nv[i+1]);
+    double dpL = duL + (m->chis[i]   - m->chis[i-1])
+                 + (m->egs[i]   - m->egs[i-1]) + log(m->Nv[i-1] / m->Nv[i]);
+    double jnR = m->mun[i+1] * m->Vt / hR *
+                 (nbuf[i+1] * bern(dnR) - nbuf[i] * bern(-dnR));
+    double jnL = m->mun[i] * m->Vt / hL *
+                 (nbuf[i] * bern(dnL) - nbuf[i-1] * bern(-dnL));
+    double jpR = m->mup[i+1] * m->Vt / hR *
+                 (pbuf[i] * bern(dpR) - pbuf[i+1] * bern(-dpR));
+    double jpL = m->mup[i] * m->Vt / hL *
+                 (pbuf[i-1] * bern(dpL) - pbuf[i] * bern(-dpL));
+    double src = rnet[i] - m->G[i];
+
+    if (m->eq_minority) {
+        int e_deg = (nbuf[i] < 1e-6 * pbuf[i]) || (nbuf[i] < 1e-20 * m->ni[i]);
+        int p_deg = (pbuf[i] < 1e-6 * nbuf[i]) || (pbuf[i] < 1e-20 * m->ni[i]);
+        if (e_deg && p_deg) p_deg = 0;
+        if (!e_deg) {
+            double den = nbuf[i] > 1e-280 ? nbuf[i] : 1e-280;
+            out[1] = ((jnR - jnL) / hc - src) / den;
+        } else {
+            out[1] = u[n + i] - u[2 * n + i];
+        }
+        if (!p_deg) {
+            double den = pbuf[i] > 1e-280 ? pbuf[i] : 1e-280;
+            out[2] = ((jpR - jpL) / hc + src) / den;
+        } else {
+            out[2] = u[2 * n + i] - u[n + i];
+        }
+    } else {
+        double den_n = nbuf[i] > 1e-280 ? nbuf[i] : 1e-280;
+        double den_p = pbuf[i] > 1e-280 ? pbuf[i] : 1e-280;
+        out[1] = ((jnR - jnL) / hc - src) / den_n;
+        out[2] = ((jpR - jpL) / hc + src) / den_p;
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────────
  * 稠密 LU（部分选主元 + 行均衡）
  * ───────────────────────────────────────────────────────────────────── */
 static int dense_solve(double* A, double* b, int nn) {
@@ -896,9 +975,21 @@ static int solve_newton(pvk_model* m, double* u,
         if (getenv("PVK_DEBUG"))
             fprintf(stderr, "[pvk] it=%d rn=%.6e\n", it, rn);
 
-        /* ---- 数值雅可比（前向差分，直接写入带状存储） ----
-         * 变量 j = s*n + jn 只影响 jn-1/jn/jn+1 三个节点的残差行，
-         * 所以只需填 3*3 个元素，不必碰 O(n²) 的稠密矩阵。 */
+        /* ---- 数值雅可比（前向差分，只算被扰动节点 ±1 的三行） ----
+         * 先按当前 u 预计算密度与 SRH（与 residual 完全一致），
+         * 扰动 (s,jn) 只改变 jn 自身的 n/p/R，邻居行通过数组复用。 */
+        for (int i = 0; i < n; i++) {
+            node_dens(m, i, u, &nbuf[i], &pbuf[i]);
+            if (!isfinite(nbuf[i])) nbuf[i] = 1e300;
+            if (!isfinite(pbuf[i])) pbuf[i] = 1e300;
+            double ni = m->ni[i];
+            double np = nbuf[i] * pbuf[i];
+            if (!isfinite(np)) np = 1e300;
+            double den = m->taup[i] * (nbuf[i] + ni) + m->taun[i] * (pbuf[i] + ni);
+            rnet[i] = (den > 0.0 && isfinite(den)) ? (np - ni * ni) / den : 0.0;
+            if (!isfinite(rnet[i])) rnet[i] = 0.0;
+        }
+
         memset(band, 0, sizeof(double) * PVK_BW_W * (size_t)nn);
         for (int jn = 0; jn < n; jn++) {
             for (int s = 0; s < 3; s++) {
@@ -906,18 +997,35 @@ static int solve_newton(pvk_model* m, double* u,
                 double save = u[j];
                 double hstep = 1e-7 * (fabs(save) > 1.0 ? fabs(save) : 1.0);
                 u[j] = save + hstep;
-                residual(m, u, rtmp, nb2, pb2, rn2, NULL);
-                u[j] = save;
+
+                double sn = nbuf[jn], sp = pbuf[jn], sr = rnet[jn];
+                node_dens(m, jn, u, &nbuf[jn], &pbuf[jn]);
+                if (!isfinite(nbuf[jn])) nbuf[jn] = 1e300;
+                if (!isfinite(pbuf[jn])) pbuf[jn] = 1e300;
+                {
+                    double ni = m->ni[jn];
+                    double np = nbuf[jn] * pbuf[jn];
+                    if (!isfinite(np)) np = 1e300;
+                    double den = m->taup[jn] * (nbuf[jn] + ni)
+                               + m->taun[jn] * (pbuf[jn] + ni);
+                    rnet[jn] = (den > 0.0 && isfinite(den)) ? (np - ni * ni) / den : 0.0;
+                    if (!isfinite(rnet[jn])) rnet[jn] = 0.0;
+                }
+
                 double inv = 1.0 / hstep;
                 for (int i = jn - 1; i <= jn + 1; i++) {
                     if (i < 0 || i >= n) continue;
+                    double vloc[3];
+                    residual_local(m, u, i, nbuf, pbuf, rnet, vloc);
                     for (int t = 0; t < 3; t++) {
                         int row = 3 * i + t;
                         int col = 3 * jn + s;
                         band[(size_t)row * PVK_BW_W + (col - row + PVK_BW_L)] =
-                            (rtmp[t * n + i] - r[t * n + i]) * inv;
+                            (vloc[t] - r[t * n + i]) * inv;
                     }
                 }
+                u[j] = save;
+                nbuf[jn] = sn; pbuf[jn] = sp; rnet[jn] = sr;
             }
         }
 
