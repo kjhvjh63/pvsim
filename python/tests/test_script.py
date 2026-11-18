@@ -235,6 +235,20 @@ gauss = parse_deck("doping region=1 gaussian n.type conc=1e18\n" + MINIMAL)
 check("gaussian 提示按均匀近似",
       any("gaussian" in w for w in gauss.warnings), str(gauss.warnings))
 
+dop_win = parse_deck("doping region=1 x.min=0 x.max=0.1 n.type conc=1e18\n" + MINIMAL)
+check("doping 窗口提示按整层处理",
+      any("x.min" in w for w in dop_win.warnings), str(dop_win.warnings))
+
+reg_mat = parse_deck("material region=2 eg=1.5\n" + MINIMAL)
+check("material region= 可省略 name",
+      reg_mat.first(ast.MaterialStmt).region == 2
+      and reg_mat.first(ast.MaterialStmt).as_dict()["Eg_eV"] == 1.5)
+
+xmesh = parse_deck("x.mesh loc=0 spac=0.01\n" + MINIMAL)
+check("x.mesh 兼容并提示",
+      any("x.mesh" in w for w in xmesh.warnings)
+      and not xmesh.of(ast.UnknownStmt), str(xmesh.warnings))
+
 # ---------------------------------------------------------------------------
 # 3. 编译
 # ---------------------------------------------------------------------------
@@ -306,6 +320,36 @@ save_msgs = []
 DeckCompiler(log=save_msgs.append).compile_text("save outfile=out/a.str\n" + MINIMAL)
 check("save 提示由 dataio 负责", any("save" in m for m in save_msgs),
       str(save_msgs))
+
+TWO_SAME = ("region material=FTO thickness=100\n"
+            "region material=MAPbI3 thickness=200\n"
+            "region material=MAPbI3 thickness=300\n"
+            "region material=Au thickness=80\n")
+reg_spec = DeckCompiler().compile_text("material region=3 eg=1.5\n" + TWO_SAME)
+check("region 级 material 只覆盖目标层",
+      reg_spec.device.layers[2].Eg_eV == 1.5
+      and reg_spec.device.layers[1].Eg_eV == 1.6,
+      f"{reg_spec.device.layers[1].Eg_eV} / {reg_spec.device.layers[2].Eg_eV}")
+check("region 级 material 指向不存在的层报错",
+      isinstance(_try(lambda: DeckCompiler().compile_text(
+          "material region=9 eg=1.5\n" + TWO_SAME), SpecError), SpecError))
+
+name_msgs = []
+DeckCompiler(log=name_msgs.append).compile_text(
+    "material region=3 name=FTO eg=1.5\n" + TWO_SAME)
+check("region 级 name 与层材料不一致时提示",
+      any("FTO" in m and "region=3" in m for m in name_msgs), str(name_msgs))
+
+multi_msgs = []
+multi = DeckCompiler(log=multi_msgs.append).compile_text(
+    "solve vanode=0.2\nsolve vanode=0.2 vfinal=1.0 vstep=0.1\n" + MINIMAL)
+check("多条 solve 合并起点/终点",
+      multi.sweep.v_start == 0.2 and multi.sweep.v_stop == 1.0,
+      f"{multi.sweep.v_start}→{multi.sweep.v_stop}")
+check("多条 solve 点数按最后一条", multi.sweep.n_points == 9,
+      str(multi.sweep.n_points))
+check("多条 solve 有合并提示", any("solve" in m for m in multi_msgs),
+      str(multi_msgs))
 
 minimal = DeckCompiler().compile_text(MINIMAL)
 check("compile_text 一步到位", len(minimal.device.layers) == 3)

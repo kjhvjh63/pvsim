@@ -53,6 +53,7 @@ class ContactStmt:
 class MaterialStmt:
     name:   str = ""
     params: Tuple[Tuple[str, float], ...] = ()   # 已映射成 LayerSpec 字段名
+    region: Optional[int] = None                 # Atlas 写法：只覆盖该 region
     line:   int = 0
 
     def as_dict(self) -> Dict[str, float]:

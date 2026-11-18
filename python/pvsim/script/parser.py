@@ -242,7 +242,8 @@ def _p_doping(values: ValueMap, flags: List[str], word: Token,
     _reject_unknown(values, flags,
                     ("region", "conc", "concentration", "doping",
                      "nd", "na", "type", "n.type", "p.type",
-                     "uniform", "gaussian", "erfc"),
+                     "uniform", "gaussian", "erfc",
+                     "x.min", "x.max", "xmin", "xmax"),
                     word.line, warnings, "doping")
 
     # 1D 内核只支持均匀掺杂；gaussian/erfc 明确提示"按均匀近似"，
@@ -252,6 +253,10 @@ def _p_doping(values: ValueMap, flags: List[str], word: Token,
             warnings.append(
                 f"L{word.line}: doping {profile} 未实现，按 uniform 均匀掺杂处理"
             )
+    if _get(values, "x.min", "x.max", "xmin", "xmax") is not None:
+        warnings.append(
+            f"L{word.line}: doping 的 x.min/x.max 窗口未实现，按整层均匀处理"
+        )
 
     kind = None
     conc = None
@@ -303,11 +308,13 @@ def _p_contact(values: ValueMap, flags: List[str], word: Token,
 def _p_material(values: ValueMap, flags: List[str], word: Token,
                 warnings: List[str]) -> ast.MaterialStmt:
     _reject_unknown(values, flags,
-                    ("name", "material") + tuple(_PARAM_KEYS),
+                    ("name", "material", "region", "num") + tuple(_PARAM_KEYS),
                     word.line, warnings, "material")
+    region_num = _int(values, "region", "num")
     name = _word(values, "name", "material")
-    if name is None:
-        raise DeckSyntaxError("material 缺少 name=", word.line, word.col)
+    if name is None and region_num is None:
+        raise DeckSyntaxError("material 缺少 name=（或按 Atlas 写法给 region=）",
+                              word.line, word.col)
 
     params: List[Tuple[str, float]] = []
     for key, field in _PARAM_KEYS.items():
@@ -316,8 +323,10 @@ def _p_material(values: ValueMap, flags: List[str], word: Token,
             if num is not None:
                 params.append((field, float(num)))
     if not params:
-        warnings.append(f"L{word.line}: material '{name}' 没有任何参数覆盖")
-    return ast.MaterialStmt(name=name, params=tuple(sorted(params)), line=word.line)
+        who = f"material '{name}'" if name else f"region {region_num}"
+        warnings.append(f"L{word.line}: {who} 没有任何参数覆盖")
+    return ast.MaterialStmt(name=name or "", params=tuple(sorted(params)),
+                            region=region_num, line=word.line)
 
 
 def _p_models(values: ValueMap, flags: List[str], word: Token,
@@ -448,6 +457,16 @@ def _p_workflow(values: ValueMap, flags: List[str], word: Token,
     return ast.WorkflowStmt(keyword=word.value.lower(), raw=raw, line=word.line)
 
 
+def _p_xmesh(values: ValueMap, flags: List[str], word: Token,
+             warnings: List[str]) -> ast.WorkflowStmt:
+    """Atlas 的 ``x.mesh loc=.. spac=..``：本平台网格由 nodes/refine 统一控制。"""
+    warnings.append(
+        f"L{word.line}: {word.value} 未实现，网格由 mesh nodes=/interface.refine= 统一控制"
+    )
+    raw = " ".join([word.value] + flags + list(values))
+    return ast.WorkflowStmt(keyword=word.value.lower(), raw=raw, line=word.line)
+
+
 _HANDLERS: Dict[str, Callable[[ValueMap, List[str], Token, List[str]], Any]] = {
     "mesh": _p_mesh,
     "region": _p_region,
@@ -469,6 +488,8 @@ _HANDLERS: Dict[str, Callable[[ValueMap, List[str], Token, List[str]], Any]] = {
     "quit": _p_workflow,
     "plot": _p_workflow,
     "tonyplot": _p_workflow,
+    "x.mesh": _p_xmesh,
+    "y.mesh": _p_xmesh,
 }
 
 

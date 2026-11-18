@@ -174,8 +174,27 @@ class DeckCompiler:
                                 details=[f"已用编号 {numbers}"])
             numbers.append(num)
 
-        overrides = {m.name.upper(): m.as_dict()
-                     for m in deck.of(ast.MaterialStmt)}
+        # 材性覆盖两种写法：material name=MAPBI3 eg=...（按材料），
+        # 与 Atlas 的 material region=3 eg=...（只作用于该层）。
+        overrides: Dict[str, Dict[str, float]] = {}
+        region_overrides: Dict[int, Dict[str, float]] = {}
+        region_material = {
+            (r.number if r.number is not None else i + 1): r.material.upper()
+            for i, r in enumerate(regions)
+        }
+        for m in deck.of(ast.MaterialStmt):
+            if m.region is None:
+                overrides.setdefault(m.name.upper(), {}).update(m.as_dict())
+            else:
+                if m.region not in numbers:
+                    raise SpecError(
+                        f"material 指向不存在的 region {m.region}",
+                        details=[f"已有编号 {numbers}"])
+                if m.name and m.name.upper() != region_material[m.region]:
+                    self._log(f"material region={m.region} 声明 name={m.name}，"
+                              f"但该层材料是 {region_material[m.region]}"
+                              f"（覆盖仍按 region 生效）")
+                region_overrides.setdefault(m.region, {}).update(m.as_dict())
 
         doping_by_region: Dict[int, List[ast.DopingStmt]] = {}
         for doping in deck.of(ast.DopingStmt):
@@ -209,6 +228,8 @@ class DeckCompiler:
                              "或在 deck 里用 material name=... eg=... 显式给参数"],
                 )
             params.update(overrides.get(key, {}))
+            if num in region_overrides:     # Atlas material region=N：仅覆盖本层
+                params.update(region_overrides[num])
             resolved.setdefault(key, dict(params))
 
             for doping in doping_by_region.get(num, ()):
@@ -303,23 +324,32 @@ class DeckCompiler:
     def _build_sweep(self, deck: ast.Deck) -> SweepSpec:
         solver = self._build_solver(deck)
 
-        solve = deck.last(ast.SolveStmt)
+        # Atlas deck 常用多条 solve 递进加压（solve vanode=0.5 / solve vanode=1.0 ...）。
+        # 本平台一次扫描覆盖全过程：起点取第一条能给出起点的 solve，
+        # 终点/步长取最后一条给出的值。
+        solves = deck.of(ast.SolveStmt)
         v_start = 0.0
         v_stop = 1.8
         n_points = 37
-        if solve is not None:
-            if solve.v_start is not None:
-                v_start = float(solve.v_start)
-            if solve.v_stop is not None:
-                v_stop = float(solve.v_stop)
-            if solve.n_points is not None:
-                n_points = int(solve.n_points)
-            elif solve.v_step is not None:
-                if solve.v_step <= 0:
-                    raise SpecError(f"solve vstep={solve.v_step} 必须 > 0")
-                n_points = int(round((v_stop - v_start) / solve.v_step)) + 1
-            if solve.log:
+        if solves:
+            for s in solves:
+                if s.v_start is not None:
+                    v_start = float(s.v_start)
+                    break
+            last = solves[-1]
+            if last.v_stop is not None:
+                v_stop = float(last.v_stop)
+            if last.n_points is not None:
+                n_points = int(last.n_points)
+            elif last.v_step is not None:
+                if last.v_step <= 0:
+                    raise SpecError(f"solve vstep={last.v_step} 必须 > 0")
+                n_points = int(round((v_stop - v_start) / last.v_step)) + 1
+            if any(s.log for s in solves):
                 self._log("solve log：SSF 落盘由 dataio 负责，内核不直接写文件")
+            if len(solves) > 1:
+                self._log(f"deck 有 {len(solves)} 条 solve，已合并为一次 "
+                          f"{v_start:g}→{v_stop:g} V 扫描")
 
         bc_type, wf_anode, wf_cathode, an_fixed, ca_fixed = self._build_contacts(deck)
         return SweepSpec(
