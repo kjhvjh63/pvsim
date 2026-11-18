@@ -24,9 +24,9 @@ jobs:
         run: |
           set -o pipefail
           cmake -S csrc -B csrc/build -DCMAKE_BUILD_TYPE=Release
-          # 失败时把日志尾部变成注解，便于在 API/网页上直接定位
+          # 失败时只把错误行（含上下文）变成注解，便于在 API/网页上定位
           if ! cmake --build csrc/build -j"$(nproc)" > build.log 2>&1; then
-            tail -n 30 build.log | while IFS= read -r line; do
+            grep -n -A4 "error:" build.log | head -n 40 | while IFS= read -r line; do
               echo "::error::${line//%/%25}"
             done
             exit 1
