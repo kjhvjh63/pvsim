@@ -315,6 +315,20 @@ with tempfile.TemporaryDirectory() as tmp:
     res_nk = Simulator().run(spec_nk)
     check("k=0 时 Jsc 接近 0", abs(res_nk.jv.Jsc) < 0.5, f"Jsc={res_nk.jv.Jsc}")
 
+    # bandgap.mask：nk 表的亚带隙 k 必须按 Eg 截断（Eg=1.6 eV ⇒ λ>775 nm）
+    (nk_dir / "MAPbI3.txt").write_text(
+        "6\n0.3 2.5 0\n0.5 2.5 0\n0.7 2.5 0\n"
+        "0.8 2.4 0.02\n0.9 2.4 0.3\n1.2 2.3 0.3\n", encoding="utf-8")
+    spec_mask = replace(spec, optics=replace(spec.optics, nk_dir=str(nk_dir),
+                                             bandgap_mask=True))
+    spec_nomask = replace(spec, optics=replace(spec.optics, nk_dir=str(nk_dir),
+                                               bandgap_mask=False))
+    j_mask = Simulator().run(spec_mask).jv.Jsc
+    j_nomask = Simulator().run(spec_nomask).jv.Jsc
+    check("bandgap.mask 截断亚带隙吸收",
+          j_nomask > 1.0 and j_mask < 0.2 * j_nomask,
+          f"mask={j_mask:.3f}, no-mask={j_nomask:.3f}")
+
 
 
 

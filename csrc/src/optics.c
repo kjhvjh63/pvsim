@@ -172,13 +172,18 @@ static double alpha_phenom(const pvk_device* dev, int li, double E_eV) {
  * 因此两边层号不同时，这条边属于右节点的层。
  * nk 表命中且 λ 在范围内时用 4πk/λ，否则退回唯象模型。 */
 static double alpha_of(const pvk_device* dev, int li, double E_eV,
-                       double lam_nm, const pvk_nk* nk_table) {
+                       double lam_nm, const pvk_nk* nk_table, int bg_mask) {
     if (li < 0 || li >= dev->n_layers) return 0.0;
     const pvk_layer* L = &dev->layers[li];
     if (!L->is_gen || L->is_contact || L->thick_nm <= 0.0) return 0.0;
 
     double k_val;
     if (nk_lookup(nk_table, lam_nm, NULL, &k_val)) {
+        /* bandgap.mask：实测 nk 表普遍带亚带隙吸收尾巴（Urbach/缺陷），
+         * 直接 4πk/λ 会让 Eg=1.61 eV 的吸收层一直吸到 1.1 µm，
+         * Jsc 冲出带隙上限（复刻卡实测 28.18，理论上限 ~24.5）。
+         * 声明了 Eg 且要求掩模时按 Eg 截断。 */
+        if (bg_mask && L->Eg_eV > 0.0 && E_eV <= L->Eg_eV) return 0.0;
         if (!(k_val > 0.0) || !isfinite(k_val)) return 0.0;
         return 4.0 * 3.14159265358979323846 * k_val / (lam_nm * 1e-7);  /* cm⁻¹ */
     }
@@ -266,7 +271,8 @@ PVK_API int pvk_optics_compute(pvk_ctx* ctx,
         for (int i = 0; i < n_node; i++) {
             int li = ctx->mesh.node_layer[i];
             alpha[i] = alpha_of(dev, li, E, lam,
-                                (nks && li >= 0 && li < dev->n_layers) ? &nks[li] : NULL);
+                                (nks && li >= 0 && li < dev->n_layers) ? &nks[li] : NULL,
+                                opt->bandgap_mask);
         }
 
         if (nks && nk_layers > 0) {
