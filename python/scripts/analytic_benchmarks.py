@@ -14,6 +14,10 @@
      SRH=np/(τ(n+p)) 中 (n+p) 增速超过 e^(V/2Vt)，压低了 SRH 随 V
      的增速。已排除网格伪影（201/2 同值）与串联电阻（Voc 处 J=0）。
      此锚点只防行为回退，不代表物理正确；待外部软件对照后再定取舍。
+  8. 厚吸收层粗网格锚点（1500nm）：曾因 40nm TiO2 在 101 节点网格下
+     只剩 1 个节点、被电极 bc 吞并，导致 cpl 钉扎侵入吸收层，
+     Jsc 塌到暗电流量级却被报成收敛。现要求 @101 与 @201 的 Jsc
+     相差 <20%，且 1500nm 的 Jsc 不低于 500nm 的 70%。
 
 --export DIR 会把 1 sun 的 J-V 写成 SSF/.log（DeckBuild 可直接打开），
 用于和 SCAPS / Silvaco 等外部结果逐点对照。
@@ -131,6 +135,22 @@ def main() -> int:
     third = run(intensity=30.0)
     n_light = (sun.jv.Voc - third.jv.Voc) / np.log(100.0 / 30.0) / Vt
     check("2.5 ≤ n_light ≤ 3.6", 2.5 <= n_light <= 3.6, f"n_light={n_light:.3f}")
+
+    print("8. 厚吸收层粗网格锚点（1500nm，防 cpl 钉扎侵入吸收层）")
+    def run_thick(nodes):
+        ls = list(base.device.layers)
+        ls[k_abs] = replace(ls[k_abs], thick_nm=1500.0)
+        spec = replace(base, device=replace(base.device, layers=tuple(ls),
+                                            nodes=nodes, interface_refine=1.0))
+        spec = replace(spec, sweep=replace(spec.sweep, v_start=0.0, v_stop=0.0,
+                                           n_points=1))
+        return Simulator().run(spec).points[0].J_mA_cm2
+    j15_fine, j15_coarse = run_thick(201), run_thick(101)
+    check("1500nm@201 |Jsc| ≥ 0.7×500nm", abs(j15_fine) >= 0.7 * abs(sun.jv.Jsc),
+          f"Jsc(1500)={j15_fine:.4f}, Jsc(500)={sun.jv.Jsc:.4f}")
+    check("1500nm@101 与 @201 偏差 <20%",
+          abs(abs(j15_coarse) - abs(j15_fine)) / abs(j15_fine) < 0.2,
+          f"Jsc(101)={j15_coarse:.4f}, Jsc(201)={j15_fine:.4f}")
 
     print("\n参考曲线（供外部对照）")
     for inten in (10.0, 50.0, 100.0):
