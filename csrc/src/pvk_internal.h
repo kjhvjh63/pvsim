@@ -66,6 +66,13 @@ struct pvk_ctx {
     int           have_solution;
     double        last_V_applied;
     double        last_J;         /* 上次收敛点的 J (mA/cm²) */
+
+    /* ── 上一次的接触层掩码 ──
+     * 掩码随偏压会收缩。被"释放"的节点在上一步的 QFL 被钉在电极值上，
+     * 直接当暖启动初值会让残差爆到 1e63（见 mark_contact_layer）。
+     * 存上一份掩码用来识别这些节点并改从相邻自由节点取值。 */
+    unsigned char* cpl_prev;
+    int            cpl_prev_n;
 };
 
 /* ----------------------------------------------------------------- */

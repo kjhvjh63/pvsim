@@ -127,6 +127,11 @@ PVK_API void pvk_destroy(pvk_ctx* ctx) {
         pvk__free(ctx->state.fields[i]);
     }
 
+    /* 上一轮接触层掩码 */
+    pvk__free(ctx->cpl_prev);
+    ctx->cpl_prev = NULL;
+    ctx->cpl_prev_n = 0;
+
     /* 缓存的 device 副本（含每层 strdup 的字符串） */
     pvk__release_cached_device(ctx);
 

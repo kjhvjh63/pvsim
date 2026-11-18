@@ -101,12 +101,21 @@ typedef struct {
     int*    bc;         /* 0=求解, 1=阴极型 Dirichlet, 2=阳极型 Dirichlet */
     int     eq_minority;/* 1 = 少数载流子退化时用 φ_min=φ_maj 兜底 */
     /* 接触层（隐式）：0=正常, 1=阴极侧接触层, 2=阳极侧接触层。
-     * 这些节点的连续性行换成 φn/φp = 接触值（欧姆接触的无限复合），
-     * Poisson 仍求解。用于接触积累层远细于网格的情形（见 mark_contact_layer）。 */
+     * 这些节点的连续性行换成 φ 的边界方程：多数载流子钉在电极费米能级
+     * （无限复合），少子沿层平到体内（零电流，选择性接触）。Poisson 仍求解。 */
     unsigned char* cpl;
+    /* 接触层每个节点的多数载流子：1=电子, 2=空穴。
+     * 选择性接触：多数载流子的 φ 钉在电极费米能级上（无限复合），
+     * 少子的 φ 沿接触层平到体内（∂φ/∂x=0 ⇒ J=0，即少子被阻挡）。
+     * 若两端都钉死两者，TiO2/钙钛矿这类有 ~1.9 eV 价带台阶的界面会在
+     * 正偏下把空穴灌到 1e19 量级，接触层的少子通量发散。 */
+    unsigned char* cpl_maj;
     /* 接触层掩码一旦在冷启动（平衡态）确定就冻结：否则偏压变化会让
      * 掩码随 ψ 漂移，方程组在不同偏压间切换，结果不可复现。 */
     int cpl_frozen;
+    /* 本次 mark_contact_layer 里"被释放"（上一步还钉在接触层）的节点数。
+     * >0 说明方程集刚变过一次、初值离真解较远，调用方应给 Newton 更多步。 */
+    int cpl_released;
 
     double  u_bc[2];
     double  wn_bc[2];
@@ -211,6 +220,10 @@ static double residual(const pvk_model* m, const double* u, double* r,
      * "按真实方程算"的最大相对不平衡度。塌缩解（全层钉扎）靠删方程
      * 让 rel/rn 同时假收敛，但隐藏行的物理不平衡仍是 O(1)，用它识破。 */
     double hidden = 0.0;
+    /* 被排除的两端界面行按真实方程算的最大不平衡度。只做诊断：它随 1/h
+     * 增长（实测 101→397 为 1.3e-3→6.1e-2），拿来当收敛门槛会把正常点
+     * 全部拒掉，所以不参与判据。 */
+    double iface_diag = 0.0;
 
     /* 全器件源项尺度：用来把"两边都接近 0、纯数值噪声"的行排除在
      * 相对残差之外（禁带很宽的传输层里 ni/τeff 小到没有意义）。
@@ -222,14 +235,29 @@ static double residual(const pvk_model* m, const double* u, double* r,
         if (s > smax) smax = s;
     }
 
-    /* 界面相邻节点（紧邻接触的那两个自由节点）的连续性行不参与判据：
+    /* 两端紧邻接触层的**两个**自由节点的连续性行不参与判据。
      * 理想 Ohmic 金属侧的载流子密度与体内相差十几个数量级，中间积累层
-     * 只有 ~0.2 nm，实用网格解析不了。这一行的通量不平衡随 1/h 增长
-     * （实测 101→397：1.3e-3→6.1e-2），但不代表体内方程没解到位。 */
-    int first_free = -1, last_free = -1;
+     * 只有 ~0.2 nm，实用网格解析不了；再往外一个节点仍落在同一层边界层里
+     * （1.9 eV 价带台阶把空穴堆在头几个节点上，正偏 1.3 V 时 p≈9e18）。
+     * 这些行的通量不平衡随 1/h 增长（实测 101→397：1.3e-3→6.1e-2），但
+     * 不代表体内方程没解到位：同一偏压下 J 在 101/201/401 上只差 1e-3 级，
+     * 而失败边界反而随加密往下掉——说明卡住的是判据而不是解。
+     * 注意：这不影响 1500nm 的假收敛防线，那道防线用的是 eq_minority
+     * 替换行上的 hid，与这里的界面行无关。 */
+    int first_free = -1, first_free2 = -1, last_free = -1, last_free2 = -1;
     if (rel_out) {
-        for (int i = 0; i < n; i++) if (!m->bc[i] && !m->cpl[i]) { first_free = i; break; }
-        for (int i = n - 1; i >= 0; i--) if (!m->bc[i] && !m->cpl[i]) { last_free = i; break; }
+        int cnt = 0;
+        for (int i = 0; i < n && cnt < 2; i++) {
+            if (m->bc[i] || m->cpl[i]) continue;
+            if (cnt == 0) first_free = i; else first_free2 = i;
+            cnt++;
+        }
+        cnt = 0;
+        for (int i = n - 1; i >= 0 && cnt < 2; i--) {
+            if (m->bc[i] || m->cpl[i]) continue;
+            if (cnt == 0) last_free = i; else last_free2 = i;
+            cnt++;
+        }
     }
 
     for (int i = 0; i < n; i++) {
@@ -300,7 +328,8 @@ static double residual(const pvk_model* m, const double* u, double* r,
         double jnL = m->mun[i] * m->Vt / hL *
                      (nbuf[i] * bern(dnL) - nbuf[i-1] * bern(-dnL));
         double src = rnet[i] - m->G[i];
-        int iface_row = (i == first_free || i == last_free);
+        int iface_row = (i == first_free || i == first_free2 ||
+                         i == last_free || i == last_free2);
 
         /* ---- 空穴连续 ---- */
         double jpR = m->mup[i+1] * m->Vt / hR *
@@ -312,12 +341,28 @@ static double residual(const pvk_model* m, const double* u, double* r,
          * 电极旁的积累层德拜长度可到 0.1 nm，网格（哪怕 refine=2 的
          * 0.4 nm）解析不了。与其让连续性方程去追这个边界层（通量
          * 噪声把相对残差抬到 O(1)，Newton 永远停不下来），不如把这一层
-         * 归入接触：φn/φp 钉在电极费米能级上（无限表面复合，欧姆接触），
+         * 归入接触：**多数**载流子的 φ 钉在电极费米能级（无限复合），
+         * **少数**载流子的 φ 沿接触层平到体内（∂φ/∂x=0 ⇔ J=0），即
+         * 选择性接触。少子若也钉死，TiO2/钙钛矿这种 ~1.9 eV 价带台阶
+         * 的界面会被当透明接触，正偏下把空穴灌到 1e19 且界面通量发散。
          * 载流子密度仍由 Poisson 与 ψ 自洽给出。Poisson 行保留。 */
         if (m->cpl[i]) {
             int e = m->cpl[i] - 1;
-            r[n + i]     = u[n + i]     - m->wn_bc[e];
-            r[2 * n + i] = u[2*n + i]   - m->wp_bc[e];
+            int in = (m->cpl[i] == 1) ? i + 1 : i - 1;   /* 朝器件内部 */
+            int has_in = (in >= 0 && in < n);
+            int maj = m->cpl_maj ? m->cpl_maj[i] : 0;
+            if (maj == 1) {          /* 电子多数：钉 φn，空穴零电流 */
+                r[n + i]     = u[n + i] - m->wn_bc[e];
+                r[2 * n + i] = has_in ? u[2*n + i] - u[2*n + in]
+                                      : u[2*n + i] - m->wp_bc[e];
+            } else if (maj == 2) {   /* 空穴多数：钉 φp，电子零电流 */
+                r[2 * n + i] = u[2*n + i] - m->wp_bc[e];
+                r[n + i]     = has_in ? u[n + i] - u[n + in]
+                                      : u[n + i] - m->wn_bc[e];
+            } else {
+                r[n + i]     = u[n + i]     - m->wn_bc[e];
+                r[2 * n + i] = u[2*n + i]   - m->wp_bc[e];
+            }
             double sc = fabs(r[n+i]);
             if (fabs(r[2*n+i]) > sc) sc = fabs(r[2*n+i]);
             if (sc > rmax) rmax = sc;
@@ -381,6 +426,17 @@ static double residual(const pvk_model* m, const double* u, double* r,
               if (!iface_row) REL_ACC_K(rc, 2); }
         }
 
+        /* 被排除的界面行：只记诊断值（归一尺度与 REL_ACC 相同） */
+        if (iface_row) {
+            double rcn = fabs((jnR - jnL) / hc - src)
+                       / cont_scale(jnR, jnL, hc, smax);
+            double rcp = fabs((jpR - jpL) / hc + src)
+                       / cont_scale(jpR, jpL, hc, smax);
+            double rc = fmax(rcn, rcp);
+            if (!isfinite(rc)) rc = 1e6;
+            if (rc > iface_diag) iface_diag = rc;
+        }
+
         {
             double sc = fabs(r[n+i]);
             if (fabs(r[2*n+i]) > sc) sc = fabs(r[2*n+i]);
@@ -403,6 +459,10 @@ static double residual(const pvk_model* m, const double* u, double* r,
                     relpeak, reli, m->node_layer[reli], relkind,
                     m->x[reli] * 1e7, nbuf[reli], pbuf[reli]);
         }
+        /* 两端界面行（已排除在判据外）的不平衡度，仅诊断用 */
+        if (getenv("PVK_DEBUG") && iface_diag > 1e-2)
+            fprintf(stderr, "[pvk] iface rows (excluded): imbalance=%.2e\n",
+                    iface_diag);
     }
     if (hidden_out) *hidden_out = hidden;
     /* 2-范数：Newton 方向是它的下降方向（∞-范数不保证），线搜索用它 */
@@ -441,8 +501,21 @@ static void residual_local(const pvk_model* m, const double* u, int i,
 
     if (m->cpl[i]) {
         int e = m->cpl[i] - 1;
-        out[1] = u[n + i]     - m->wn_bc[e];
-        out[2] = u[2 * n + i] - m->wp_bc[e];
+        int in = (m->cpl[i] == 1) ? i + 1 : i - 1;
+        int has_in = (in >= 0 && in < n);
+        int maj = m->cpl_maj ? m->cpl_maj[i] : 0;
+        if (maj == 1) {
+            out[1] = u[n + i] - m->wn_bc[e];
+            out[2] = has_in ? u[2*n + i] - u[2*n + in]
+                            : u[2*n + i] - m->wp_bc[e];
+        } else if (maj == 2) {
+            out[2] = u[2*n + i] - m->wp_bc[e];
+            out[1] = has_in ? u[n + i] - u[n + in]
+                            : u[n + i] - m->wn_bc[e];
+        } else {
+            out[1] = u[n + i]     - m->wn_bc[e];
+            out[2] = u[2 * n + i] - m->wp_bc[e];
+        }
         return;
     }
 
@@ -664,6 +737,7 @@ static void model_free(pvk_model* m) {
     pvk__free(m->hc);
     pvk__free(m->bc);
     pvk__free(m->cpl);
+    pvk__free(m->cpl_maj);
     memset(m, 0, sizeof(*m));
 }
 
@@ -789,13 +863,16 @@ static int model_init(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
     m->hc   = (double*)pvk__malloc(dn);
     m->bc   = (int*)pvk__malloc(sizeof(int) * (size_t)n);
     m->cpl  = (unsigned char*)pvk__malloc(sizeof(unsigned char) * (size_t)n);
+    m->cpl_maj = (unsigned char*)pvk__malloc(sizeof(unsigned char) * (size_t)n);
     if (!m->eps || !m->chi || !m->Eg || !m->Nc || !m->Nv || !m->mun ||
         !m->mup || !m->taun || !m->taup || !m->Nd || !m->Na || !m->G ||
-        !m->ni || !m->chis || !m->egs || !m->hc || !m->bc || !m->cpl) {
+        !m->ni || !m->chis || !m->egs || !m->hc || !m->bc || !m->cpl ||
+        !m->cpl_maj) {
         model_free(m);
         return PVK_EMEM;
     }
     memset(m->cpl, 0, sizeof(unsigned char) * (size_t)n);
+    memset(m->cpl_maj, 0, sizeof(unsigned char) * (size_t)n);
     m->cpl_frozen = 0;
 
     const double* gopt = ctx->state.fields[PVK_FIELD_G_OPT];
@@ -1496,23 +1573,31 @@ static void equilibrium_guess(pvk_ctx* ctx, const pvk_device* dev,
  * （φ=0，只由 ψ 决定）还比 max(ni,1) 高 3 个数量级以上，就把它归入
  * 接触层：这层即电极注入的积累层，厚度由德拜长度决定（~0.1–10 nm），
  * 网格解析不了，连续性方程在这一层没有可靠的离散解。归入接触后，
- * 它的 φn/φp 钉在电极值上（无限表面复合），ψ 仍由 Poisson 求解。
+ * **多数**载流子的 φ 钉在电极值上（无限复合），**少数**载流子的 φ
+ * 沿接触层平到体内（∂φ/∂x=0 ⇔ J=0，即被阻挡的选择性接触），ψ 仍由
+ * Poisson 求解。
  *
  * 用平衡密度而不是当前密度：亮态下吸收层的 n 可以很高，但它不是
  * 接触层，必须保留完整的双载流子方程。走到层边界就停，避免把 ETL/HTL
  * 之外的吸收层卷进来。
  *
  * 【已知物理后果：亮态理想因子 >2】本模型把整个简并 ETL/HTL 归入
- * 钉扎层后，选择性提取集中在单网格节点完成，无限表面复合使钉扎区内
- * SRH 恒为 0。Voc 处体内 SRH≈总产生仍是主导，但环流电流（=Jsc）把
+ * 钉扎层后，选择性提取集中在单网格节点完成，钉扎区内 SRH 恒为 0。
+ * Voc 处体内 SRH≈总产生仍是主导，但环流电流（=Jsc）把
  * 吸收层边缘撕出随光强增大的 n/p 失衡（1 sun 时前端 p/n≈115），
  * SRH=np/(τ(n+p)) 中 (n+p) 增速超过 e^(V/2Vt)，导致 dVoc/dlnG 的
  * 表观理想因子升到 ~3（0.1–1 sun 段峰值），偏离高注入 SRH 理论值 2。
  * 已验证与网格无关（101/1 与 201/2 差 <0.05），非串联电阻（Voc 处
  * J=0），也非插值伪影（二分法精确求 Voc 同值）。回归锚点见
- * python/scripts/analytic_benchmarks.py 第 7 项；是否改用有限表面
- * 复合速度边界，待外部软件（SCAPS/Silvaco）对照后决定。 */
-static void mark_contact_layer(pvk_model* m, const double* u) {
+ * python/scripts/analytic_benchmarks.py 第 7 项。
+ *
+ * 少子边界改成零电流（选择性接触）后锚点一位数字都没变：钉扎层里少子
+ * 密度只有 1e-33 量级，它的 φ 无论钉在电极还是平到体内，对 Poisson
+ * 电荷和界面通量的贡献都小到可以忽略——这条边界方程实际是个哑变量。
+ * 实测真正的瓶颈在吸收层一侧：1.87 eV 价带台阶把空穴堆在紧邻界面
+ * 的头几个自由节点上（正偏 1.3 V 时 p≈9e18），那里 SG 通量的截断误差
+ * 让空穴连续性行的相对残差卡在 0.6 左右，Newton 再也压不下去。 */
+static void mark_contact_layer(pvk_ctx* ctx, pvk_model* m, double* u, int warm) {
     int n = m->n;
     memset(m->cpl, 0, sizeof(unsigned char) * (size_t)n);
 
@@ -1526,6 +1611,7 @@ static void mark_contact_layer(pvk_model* m, const double* u) {
             thr = 1e3 * (m->ni[i] > 1.0 ? m->ni[i] : 1.0);
             if (!(fmax(nn, pp) > thr)) break;
             m->cpl[i] = 1;
+            m->cpl_maj[i] = (nn >= pp) ? 1 : 2;
         }
     }
 
@@ -1539,8 +1625,52 @@ static void mark_contact_layer(pvk_model* m, const double* u) {
             thr = 1e3 * (m->ni[j] > 1.0 ? m->ni[j] : 1.0);
             if (!(fmax(nn, pp) > thr)) break;
             m->cpl[j] = 2;
+            m->cpl_maj[j] = (nn >= pp) ? 1 : 2;
         }
     }
+
+    /* 掩码随偏压收缩：上一步还被钉在接触层里、这一步被释放的节点，
+     * 其 φn/φp 仍是**电极的**准费米能级（钉扎值）。拿它当暖启动初值，
+     * 相当于让这些节点的载流子密度停在平衡值附近，而连续性方程要求的
+     * 是偏压下的密度，残差直接爆到 1e63 —— Cs2AgBiBr6 复刻卡在
+     * 0.90→0.92 V 阳极掩码从 20 个节点骤降到 6 个，之后整段扫描全
+     * 发散就是这个原因。这些节点改从相邻自由节点取 φ（两侧都有就取
+     * 平均），ψ 仍用上一步的值。 */
+    if (warm && ctx->cpl_prev && ctx->cpl_prev_n == n) {
+        for (int k = 0; k < n; k++) {
+            if (m->bc[k] || m->cpl[k] || !ctx->cpl_prev[k]) continue;
+            /* 只掉一个边界节点（掩码收缩一格）时，电极准费米能级仍是好初值，
+             * 保持原行为；成片释放说明发生了整层翻转，才需要重新起算。 */
+            int adj_pin = (k > 0 && m->cpl[k-1]) || (k + 1 < n && m->cpl[k+1]);
+            int adj_rel = (k > 0 && !m->cpl[k-1] && ctx->cpl_prev[k-1]) ||
+                          (k + 1 < n && !m->cpl[k+1] && ctx->cpl_prev[k+1]);
+            if (adj_pin && !adj_rel) continue;
+            int kl = -1, kr = -1;
+            for (int q = k - 1; q >= 0; q--)
+                if (!m->bc[q] && !m->cpl[q]) { kl = q; break; }
+            for (int q = k + 1; q < n; q++)
+                if (!m->bc[q] && !m->cpl[q]) { kr = q; break; }
+            if (kl < 0 && kr < 0) continue;
+            if (kl >= 0 && kr >= 0) {
+                u[n + k]     = 0.5 * (u[n + kl] + u[n + kr]);
+                u[2 * n + k] = 0.5 * (u[2*n + kl] + u[2*n + kr]);
+            } else {
+                int q = (kl >= 0) ? kl : kr;
+                u[n + k]     = u[n + q];
+                u[2 * n + k] = u[2*n + q];
+            }
+            m->cpl_released++;
+        }
+    }
+
+    /* 记下本次掩码，供下一个偏压点识别"被释放"的节点 */
+    if (!ctx->cpl_prev || ctx->cpl_prev_n != n) {
+        pvk__free(ctx->cpl_prev);
+        ctx->cpl_prev = (unsigned char*)pvk__malloc(sizeof(unsigned char) * (size_t)n);
+        ctx->cpl_prev_n = ctx->cpl_prev ? n : 0;
+    }
+    if (ctx->cpl_prev && ctx->cpl_prev_n == n)
+        memcpy(ctx->cpl_prev, m->cpl, sizeof(unsigned char) * (size_t)n);
 
     if (getenv("PVK_DEBUG")) {
         int c1 = 0, c2 = 0, k0 = -1, k1 = -1, k2 = -1, k3 = -1;
@@ -1548,22 +1678,49 @@ static void mark_contact_layer(pvk_model* m, const double* u) {
             if (m->cpl[k] == 1) { c1++; if (k0 < 0) k0 = k; k1 = k; }
             else if (m->cpl[k] == 2) { c2++; if (k2 < 0) k2 = k; k3 = k; }
         }
-        fprintf(stderr, "[pvk] contact layer: cathode %d nodes (%.1f..%.1f nm, lay=%d), "
-                        "anode %d nodes (%.1f..%.1f nm, lay=%d)\n",
+        fprintf(stderr, "[pvk] contact layer: cathode %d nodes (%.1f..%.1f nm, lay=%d, maj=%d), "
+                        "anode %d nodes (%.1f..%.1f nm, lay=%d, maj=%d)\n",
                 c1, k0 >= 0 ? m->x[k0]*1e7 : -1.0, k1 >= 0 ? m->x[k1]*1e7 : -1.0,
                 k0 >= 0 ? m->node_layer[k0] : -1,
+                k1 >= 0 ? m->cpl_maj[k1] : -1,
                 c2, k2 >= 0 ? m->x[k2]*1e7 : -1.0, k3 >= 0 ? m->x[k3]*1e7 : -1.0,
-                k2 >= 0 ? m->node_layer[k2] : -1);
+                k2 >= 0 ? m->node_layer[k2] : -1,
+                k2 >= 0 ? m->cpl_maj[k2] : -1);
     }
 }
 
-/* 接触层节点的 φn/φp 取电极费米能级（与 residual 中的方程一致）。 */
+/* 接触层节点的 φ：多数载流子取电极费米能级（与 residual 中的方程一致），
+ * 少子沿接触层平到器件内部（选择性接触，零少子电流）。传播方向必须
+ * 从内侧往外，否则链上的值还是上一轮留下的。 */
 static void apply_contact_layer_qfl(const pvk_model* m, double* u) {
-    for (int i = 0; i < m->n; i++) {
-        if (!m->cpl[i]) continue;
-        int e = m->cpl[i] - 1;
-        u[m->n + i]     = m->wn_bc[e];
-        u[2 * m->n + i] = m->wp_bc[e];
+    int n = m->n;
+    for (int i = n - 1; i >= 0; i--) {          /* 阴极侧：内侧 → 外侧 */
+        if (m->cpl[i] != 1) continue;
+        int maj = m->cpl_maj ? m->cpl_maj[i] : 0;
+        if (maj == 2) {
+            u[2 * n + i] = m->wp_bc[0];
+            u[n + i]     = (i + 1 < n) ? u[n + i + 1] : m->wn_bc[0];
+        } else if (maj == 1) {
+            u[n + i]     = m->wn_bc[0];
+            u[2 * n + i] = (i + 1 < n) ? u[2*n + i + 1] : m->wp_bc[0];
+        } else {
+            u[n + i]     = m->wn_bc[0];
+            u[2 * n + i] = m->wp_bc[0];
+        }
+    }
+    for (int i = 0; i < n; i++) {               /* 阳极侧：内侧 → 外侧 */
+        if (m->cpl[i] != 2) continue;
+        int maj = m->cpl_maj ? m->cpl_maj[i] : 0;
+        if (maj == 1) {
+            u[n + i]     = m->wn_bc[1];
+            u[2 * n + i] = (i > 0) ? u[2*n + i - 1] : m->wp_bc[1];
+        } else if (maj == 2) {
+            u[2 * n + i] = m->wp_bc[1];
+            u[n + i]     = (i > 0) ? u[n + i - 1] : m->wn_bc[1];
+        } else {
+            u[n + i]     = m->wn_bc[1];
+            u[2 * n + i] = m->wp_bc[1];
+        }
     }
 }
 
@@ -1593,8 +1750,9 @@ static void initial_guess(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
                 u[n + i]   = m->wn_bc[e];
                 u[2*n + i] = m->wp_bc[e];
             }
-            /* 掩码在首次冷启动时按平衡态冻结，暖启动只套用，不重算 */
-            if (!m->cpl_frozen) mark_contact_layer(m, u);
+            /* 掩码在首次冷启动时按平衡态冻结，暖启动只套用，不重算。
+             * 收缩时被释放的节点由 mark_contact_layer 内部改初值。 */
+            if (!m->cpl_frozen) mark_contact_layer(ctx, m, u, 1);
             apply_contact_layer_qfl(m, u);
             return;
         }
@@ -1644,7 +1802,7 @@ static void initial_guess(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
         u[2*n + i]   = m->wp_bc[e];
     }
 
-    mark_contact_layer(m, u);
+    mark_contact_layer(ctx, m, u, 0);
     m->cpl_frozen = 1;
     apply_contact_layer_qfl(m, u);
 }
@@ -1861,6 +2019,10 @@ PVK_API int pvk_solve_dc(pvk_ctx* ctx,
 
     int n = ctx->mesh.n_node;
     double V_app = bias->anode_V - bias->cathode_V;
+    /* 分支跳变防护用的"上一点"电流（要在本次求解改写 last_J 之前取） */
+    int    had_prev = ctx->have_solution;
+    double J_prev   = ctx->last_J;
+    double V_prev0  = ctx->last_V_applied;
 
     double* u = (double*)pvk__malloc(sizeof(double) * 3 * n);
     if (!u) return PVK_EMEM;
@@ -2085,10 +2247,16 @@ PVK_API int pvk_solve_dc(pvk_ctx* ctx,
 
             initial_guess(ctx, dev, &m, u, (attempt == 1 && md == 0) ? warm0 : 1);
 
+            /* 接触层掩码刚收缩过：被释放的节点是从相邻自由节点重新起算的，
+             * 初值离真解较远，这一个偏压点需要更多 Newton 步（实测 80 步
+             * 不够、150 步左右收敛）。只对这类点放宽预算，正常点不受影响。 */
+            pvk_solver_opts opts = ctx->solver_opts;
+            if (m.cpl_released > 0 && opts.max_iter > 0) opts.max_iter *= 3;
+
             pvk_solve_info trial;
             memset(&trial, 0, sizeof(trial));
             trial.n = n;
-            solve_newton(&m, u, &ctx->solver_opts, &trial);
+            solve_newton(&m, u, &opts, &trial);
 
             int ok = trial.converged;
             if (ok) {
@@ -2136,8 +2304,22 @@ PVK_API int pvk_solve_dc(pvk_ctx* ctx,
     double J = 0.0;
     if (info.converged) {
         fill_fields(ctx, &m, u, &J);
-        if (!isfinite(J) || fabs(J) > 1e5) {
+        /* 分支跳变防护：隐式接触层让方程有多条解支（例如吸收层被整层
+         * 钉扎、电流几乎为零的"死"解）。继续法从正确解支出发时，若某一步
+         * Newton 跑到另一条支上，终端电流会在 0.02 V 内反向并跳变几个
+         * Jsc —— Cs2AgBiBr6 复刻卡 1.28→1.30 V 就从 -16 跳到 +22 mA/cm²
+         * 并被宽松判据当成收敛。正常 J-V 在 Voc 附近也会反号，但 |ΔJ|
+         * 只有几 mA，所以阈值保守地取 10 mA/cm²，只拦大幅跳变。 */
+        int branch_jump = had_prev && fabs(V_app - V_prev0) < 0.1 &&
+                          isfinite(J_prev) && fabs(J_prev) > 1.0 &&
+                          J * J_prev < 0.0 &&
+                          fabs(J) > 0.5 * fabs(J_prev) &&
+                          fabs(J - J_prev) > 10.0;   /* mA/cm²：只拦大幅跳变 */
+        if (!isfinite(J) || fabs(J) > 1e5 || branch_jump) {
             /* 解出来的电流不物理（发散状态但残差判据被绕过），按失败处理 */
+            if (branch_jump && getenv("PVK_DEBUG"))
+                fprintf(stderr, "[pvk] branch jump at V=%.3f: J %.4g -> %.4g\n",
+                        V_app, J_prev, J);
             info.converged = 0;
             J = NAN;
         } else {
