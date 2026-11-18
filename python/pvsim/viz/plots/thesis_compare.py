@@ -160,6 +160,19 @@ class ThesisSet:
         return len(self.entries)
 
 
+def thesis_from_reference(result: Any, ref_jv: Any,
+                          label: str = "参考") -> ThesisSet:
+    """把 ``dataio.reference`` 读出的参考曲线包装成 :class:`ThesisSet`。
+
+    ``load_reference`` 返回的是内核惯例（短路 J<0），对照图按交付惯例
+    （短路 J>0）画，这里只做一次符号翻转。
+    """
+    v = np.asarray(ref_jv.V, dtype=float)
+    j = -np.asarray(ref_jv.J, dtype=float)
+    return ThesisSet(result=result,
+                     entries=(LiteratureEntry(label=label, jv=(v, j)),))
+
+
 def _require(result: Any) -> ThesisSet:
     if not isinstance(result, ThesisSet):
         raise MissingData(

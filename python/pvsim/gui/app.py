@@ -20,11 +20,12 @@ from typing import Any, List, Optional
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 
-from ..dataio import SilvacoLogWriter, write_jv_csv
+from ..dataio import SilvacoLogWriter, load_reference, write_jv_csv
+from ..dataio.reference import compare
 from ..param.schema import SpecError
 from ..script import DeckCompiler, DeckSyntaxError
 from ..solver import Simulator
-from ..viz import REGISTRY, MissingData, fallback
+from ..viz import REGISTRY, MissingData, fallback, thesis_from_reference
 from ..viz.registry import PlotRegistry
 from . import dialogs
 from .editor import DeckEditor
@@ -71,6 +72,9 @@ class App(tk.Tk):
 
         self.result: Any = None       # 最近一次求解结果（仅用于绘图）
         self.spec: Any = None         # 最近一次编译出的 ProblemSpec
+        self.reference: Any = None    # 外部参考曲线（JVData，内核惯例）
+        self.reference_path: Optional[Path] = None
+        self.report: Any = None       # 最近一次对照报告
         self._worker: Optional[SolveWorker] = None
         self._events: "queue.Queue[SolveEvent]" = queue.Queue()
         self._plot_ids: List[str] = list(self.registry.ids())
@@ -94,6 +98,7 @@ class App(tk.Tk):
             on_mesh=self.edit_mesh, on_physics=self.edit_physics,
             on_solve=self.edit_solve, on_output=self.edit_output,
             on_compile=self.check_compile, on_export=self.export_results,
+            on_reference=self.open_reference,
             examples=self._example_decks(), on_example=self.load_example,
         )
         self.configure(menu=menubar)
@@ -170,6 +175,22 @@ class App(tk.Tk):
         self.result_tree.pack(fill=tk.BOTH, expand=True)
         right.add(result_tab, text="结果")
 
+        # 对照表：外部参考曲线与仿真结果的逐项偏差
+        compare_tab = ttk.Frame(right)
+        self.compare_tree = ttk.Treeview(
+            compare_tab,
+            columns=("metric", "sim", "ref", "delta", "ok"),
+            show="headings", height=8)
+        for col, label, width in (("metric", "指标", 80),
+                                  ("sim", "仿真", 110),
+                                  ("ref", "参考", 110),
+                                  ("delta", "偏差", 110),
+                                  ("ok", "判定", 60)):
+            self.compare_tree.heading(col, text=label)
+            self.compare_tree.column(col, width=width, anchor="w")
+        self.compare_tree.pack(fill=tk.BOTH, expand=True)
+        right.add(compare_tab, text="对照")
+
         log_tab = ttk.Frame(right)
         self.log_panel = LogPanel(log_tab, height=12)
         self.log_panel.pack(fill=tk.BOTH, expand=True)
@@ -181,6 +202,7 @@ class App(tk.Tk):
         self.bind("<Control-o>", lambda _e: self.open_deck())
         self.bind("<Control-s>", lambda _e: self.save_deck())
         self.bind("<Control-k>", lambda _e: self.check_compile())
+        self.bind("<Control-r>", lambda _e: self.open_reference())
 
     def _plot_labels(self) -> List[str]:
         return [f"{self.registry.get(pid).group} · {self.registry.get(pid).title}"
@@ -364,6 +386,67 @@ class App(tk.Tk):
         self.log(_LOG_INFO, f"已导出：{path}")
 
     # ------------------------------------------------------------------
+    # 外部参考曲线对照
+    # ------------------------------------------------------------------
+    def open_reference(self) -> None:
+        path = filedialog.askopenfilename(
+            title="打开参考曲线（SCAPS / Silvaco）",
+            filetypes=[("参考曲线", "*.iv *.log *.ssf *.dat *.csv *.txt"),
+                       ("所有文件", "*.*")],
+            initialdir=str(self.workspace / "refs"),
+        )
+        if not path:
+            return
+        self.load_reference_file(path)
+
+    def load_reference_file(self, path: Any) -> None:
+        """读取参考曲线并刷新对照表/对照图（不弹文件对话框，便于测试）。"""
+        try:
+            ref = load_reference(path)
+        except Exception as exc:                  # noqa: BLE001 - 统一提示
+            self.log(_LOG_ERROR, f"参考曲线读取失败：{exc}")
+            messagebox.showerror("参考曲线读取失败", str(exc))
+            return
+        self.reference = ref
+        self.reference_path = Path(path)
+        self.log(_LOG_INFO,
+                 f"参考曲线：{self.reference_path.name}  "
+                 f"Jsc={ref.Jsc:.4f}  Voc={ref.Voc:.4f}  FF={ref.FF:.4f}")
+        self._update_compare()
+        if self.result is not None and "compare_jv" in self._plot_ids:
+            self.select_plot("compare_jv")
+            self.draw("compare_jv")
+
+    def _update_compare(self) -> None:
+        """用当前求解结果与参考曲线算一次对照；缺任一侧就清空。"""
+        self.report = None
+        if self.reference is not None and self.result is not None:
+            try:
+                self.report = compare(self.result.jv, self.reference)
+            except ValueError as exc:
+                self.log(_LOG_WARN, f"无法对照：{exc}")
+        self._refresh_compare()
+
+    def _refresh_compare(self) -> None:
+        tree = self.compare_tree
+        tree.delete(*tree.get_children())
+        if self.report is None:
+            return
+        for m in self.report.metrics:
+            tree.insert("", tk.END, values=(
+                m.name, f"{m.sim:.4f}", f"{m.ref:.4f}",
+                f"{m.delta:+.4f}", "✓" if m.ok else "✗"))
+        tree.insert("", tk.END, values=(
+            "RMSE", f"{self.report.rmse_mA_cm2:.4f}",
+            f"{self.report.rmse_tol:g}", "mA/cm²",
+            "✓" if self.report.rmse_mA_cm2 <= self.report.rmse_tol else "✗"))
+        self.log(_LOG_INFO if self.report.passed else _LOG_WARN,
+                 f"对照{'通过' if self.report.passed else '未通过'}："
+                 f"RMSE={self.report.rmse_mA_cm2:.3f} mA/cm²，"
+                 f"公共区间 {self.report.v_window[0]:g}→"
+                 f"{self.report.v_window[1]:g} V")
+
+    # ------------------------------------------------------------------
     # 求解
     # ------------------------------------------------------------------
     def run_current(self) -> None:
@@ -420,6 +503,7 @@ class App(tk.Tk):
         elif event.kind == EVT_DONE:
             self.result = event.payload
             self._refresh_results()
+            self._update_compare()
             self._progress.configure(
                 value=float(self._progress.cget("maximum")))
             summary = getattr(event.payload, "summary", None)
@@ -462,8 +546,15 @@ class App(tk.Tk):
             return
 
         if self.result is not None:
+            data = self.result
+            item = self.registry.get(plot_id)
+            if self.reference is not None and "compare" in item.needs:
+                label = (self.reference_path.name
+                         if self.reference_path is not None else "参考")
+                data = thesis_from_reference(self.result, self.reference,
+                                             label=label)
             try:
-                self.registry.render(plot_id, self.result, ax=ax)
+                self.registry.render(plot_id, data, ax=ax)
                 self._status.set(f"已绘制：{self.registry.get(plot_id).title}")
                 self.canvas.draw_idle()
                 return

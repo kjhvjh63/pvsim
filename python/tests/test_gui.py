@@ -79,6 +79,8 @@ MINIMAL_DECK = (
     "region material=Au thickness=80\n"
     "solve vstart=0 vfinal=1.8 vstep=0.1\n"
 )
+DEVICE_DECK = (ROOT.parent / "decks" / "device_example.tst").read_text(
+    encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +251,8 @@ if has_display:
             check("菜单栏 7 项（文件/网格/物理/求解/输出/绘图/帮助）",
                   app.nametowidget(app["menu"]).index("end") == 6,
                   str(app.nametowidget(app["menu"]).index("end")))
-            check("右侧 4 个页签（绘图/结构/结果/日志）",
-                  len(app.notebook.tabs()) == 4, str(len(app.notebook.tabs())))
+            check("右侧 5 个页签（绘图/结构/结果/对照/日志）",
+                  len(app.notebook.tabs()) == 5, str(len(app.notebook.tabs())))
             check("缺少示例 deck 时仍可启动", app.result is None)
 
             app.editor.set_text(MINIMAL_DECK)
@@ -302,6 +304,35 @@ if has_display:
                   "缺少数据" in app._status.get(), app._status.get())
             check("缺场量时不画空曲线",
                   len(app.figure.axes[0].lines) == 0)
+
+            # 参考曲线对照：换 5 层参考电池跑一次，再把结果写成 .csv 读回
+            app.result = None
+            app.editor.set_text(DEVICE_DECK)
+            app.run_current()
+            deadline = time.time() + 60.0
+            while time.time() < deadline:
+                app.update()
+                if app.result is not None and not (
+                        app._worker is not None and app._worker.is_alive()):
+                    break
+                time.sleep(0.02)
+
+            from pvsim.dataio import write_jv_csv
+            ref_path = Path(tmp) / "self_ref.csv"
+            write_jv_csv(app.result.jv, ref_path)
+            app.load_reference_file(ref_path)
+            check("参考曲线已载入", app.reference is not None)
+            check("对照报告自对照通过",
+                  app.report is not None and app.report.passed,
+                  "" if app.report is None else str(app.report.rmse_mA_cm2))
+            check("对照表 5 行（4 指标 + RMSE）",
+                  len(app.compare_tree.get_children()) == 5,
+                  str(len(app.compare_tree.get_children())))
+            app.draw("compare_jv")
+            check("对照图画出两条曲线",
+                  len(app.figure.axes) == 1
+                  and len(app.figure.axes[0].lines) >= 2,
+                  str(len(app.figure.axes[0].lines)))
 
             app.result = None
             app.draw("cell_jv_curve")

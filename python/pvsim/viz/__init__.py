@@ -39,11 +39,13 @@ from .plots.thesis_compare import (
     load_curve,
     load_dat,
     load_xlsx,
+    thesis_from_reference,
 )
 
 __all__ = [
     "REGISTRY", "MissingData", "PlotConfig", "PlotItem", "PlotRegistry",
     "ScanSet", "scan_summary_ids",
     "ThesisSet", "LiteratureEntry", "load_curve", "load_dat", "load_xlsx",
+    "thesis_from_reference",
     "axes_style", "fallback", "plots",
 ]

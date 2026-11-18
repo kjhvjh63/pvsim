@@ -46,6 +46,7 @@ def build_menu_bar(root: tk.Misc, registry: PlotRegistry, *,
                    on_output: Optional[Callable[[], None]] = None,
                    on_compile: Optional[Callable[[], None]] = None,
                    on_export: Optional[Callable[[], None]] = None,
+                   on_reference: Optional[Callable[[], None]] = None,
                    examples: Sequence[Tuple[str, str]] = (),
                    on_example: Optional[Callable[[str], None]] = None) -> tk.Menu:
     """文件 / 网格 / 物理 / 求解 / 输出 / 绘图 / 帮助。
@@ -58,6 +59,9 @@ def build_menu_bar(root: tk.Misc, registry: PlotRegistry, *,
     file_menu = tk.Menu(bar, tearoff=0)
     file_menu.add_command(label="打开 deck…", command=on_open, accelerator="Ctrl+O")
     file_menu.add_command(label="保存 deck", command=on_save, accelerator="Ctrl+S")
+    if on_reference is not None:
+        file_menu.add_command(label="打开参考曲线（SCAPS/Silvaco）…",
+                              command=on_reference, accelerator="Ctrl+R")
     file_menu.add_separator()
     if on_compile is not None:
         file_menu.add_command(label="编译检查", command=on_compile,
