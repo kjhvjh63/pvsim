@@ -212,6 +212,7 @@ static double residual(const pvk_model* m, const double* u, double* r,
 
     double rmax = 0.0;
     double rsum2 = 0.0;
+    int rmax_i = -1, rmax_k = 0;   /* 最大缩放残差的位置，仅 PVK_DEBUG 诊断用 */
     double relsum = 0.0;   /* 相对残差平方和（判收敛用） */
     int    relcnt = 0;
     double relpeak = 0.0;  /* 峰值相对残差及其位置（诊断用） */
@@ -234,6 +235,12 @@ static double residual(const pvk_model* m, const double* u, double* r,
         double s = fabs(m->G[i]) + m->ni[i] / t;
         if (s > smax) smax = s;
     }
+    /* 暗态/低光时上面的尺度只剩 ni/τ，比多数载流子的复合量级小十一
+     * 个数量级；而中性区里 p=4e16 的 SG 通量（~p·Vt/h）的 double 舍入
+     * 就有 ~1e15 cm⁻³s⁻¹，缩放残差因此有 1e3~1e4 的地板，rn 永远压不到
+     * tol（0.01/0.1 mW/cm² 实测 0/101）。这个地板交给牛顿迭代里的
+     * "步长判据"处理（见 dumax），不要在这里放大尺度——放大后会提前
+     * 放行半收敛解，1 mW/cm² 的 Jsc 会被算错 1.9 倍。 */
 
     /* 两端紧邻接触层的**两个**自由节点的连续性行不参与判据。
      * 理想 Ohmic 金属侧的载流子密度与体内相差十几个数量级，中间积累层
@@ -438,9 +445,9 @@ static double residual(const pvk_model* m, const double* u, double* r,
         }
 
         {
-            double sc = fabs(r[n+i]);
-            if (fabs(r[2*n+i]) > sc) sc = fabs(r[2*n+i]);
-            if (sc > rmax) rmax = sc;
+            double scn = fabs(r[n+i]), scp = fabs(r[2*n+i]);
+            double sc = scn > scp ? scn : scp;
+            if (sc > rmax) { rmax = sc; rmax_i = i; rmax_k = (scn >= scp) ? 1 : 2; }
             rsum2 += r[n+i]*r[n+i] + r[2*n+i]*r[2*n+i];
         }
     }
@@ -465,6 +472,12 @@ static double residual(const pvk_model* m, const double* u, double* r,
                     iface_diag);
     }
     if (hidden_out) *hidden_out = hidden;
+    if (getenv("PVK_DEBUG") && rmax > 1e-1 && rmax_i >= 0) {
+        fprintf(stderr,
+                "[pvk] rmax=%.3e node=%d layer=%d kind=%d x=%.2f nm n=%.3g p=%.3g\n",
+                rmax, rmax_i, m->node_layer[rmax_i], rmax_k,
+                m->x[rmax_i] * 1e7, nbuf[rmax_i], pbuf[rmax_i]);
+    }
     /* 2-范数：Newton 方向是它的下降方向（∞-范数不保证），线搜索用它 */
     return sqrt(rsum2 / (double)(3 * n));
 }
@@ -1186,6 +1199,13 @@ static int solve_newton(pvk_model* m, double* u,
         memcpy(r, rtmp, sizeof(double) * nn);
         rn = rn_new;
         iters = it + 1;
+
+        /* 注：低光/暗态下 SG 通量的 double 舍入给残差设了 ~1e15 cm-3 s-1 的
+         * 地板（缩放后 1e3~1e4），rn 到不了 tol。已试过两种放行方式：
+         *   * 抬高 smax 到 1e-3*(净掺杂/tau)：1 mW/cm2 的 Jsc 会错 1.9 倍；
+         *   * 步长判据 dumax<1e-6：1 mW/cm2 正确，但 0.1/0.01 mW/cm2 会停在
+         *     错误解上（Jsc 偏小 1.5 倍、Voc 反而更高）。
+         * 两者都不可接受，已回退；低光收敛要从方程尺度化入手。 */
 
         /* 物理判据提前放行：通量相对残差（局部电流守恒/泊松/边界）已经
          * < 1e-3 时，2-范数可能仍被"按 n 或 p 归一"的少数载流子行撑在
