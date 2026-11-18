@@ -1,22 +1,60 @@
-# Silvaco 通用材料库（子集）
+# Silvaco 通用材料库（常用条目子集）
 #
-# 这里只放了 pvsim 目前用得到的条目，数值为 300 K 常用近似值。
+# 对标 Atlas 标准材料库的常用部分：元素/III-V 半导体、宽禁带、
+# 常用介质层与电极金属。数值为 300 K 文献常用近似值，
 # 正式对标时应替换为 Silvaco 原始 .mat 文件（格式兼容，可直接覆盖本文件）。
 #
 # 支持键：permittivity(=eps)、eg300(=eg)、chi3(=chi)、nc300/nv300、
 #         mun、mup、taun0/taup0；其余键保留在 extra 中不参与计算。
+#
+# 约定说明：
+# * 金属沿用与 AU/AG 相同的表示：chi3=逸出功，eps=1，nc=nv=1e22，
+#   迁移率为名义值（电极节点被 cpl 钉扎，输运参数实际不参与计算）；
+# * 介质层的 nc/nv/mun/mup 为名义占位值，起作用的是 permittivity 与 eg300。
 
 material name=SI
   permittivity=11.7 eg300=1.12 chi3=4.05 \
   nc300=2.8e19 nv300=1.04e19 mun=1400 mup=450
 
+material name=GE
+  permittivity=16.0 eg300=0.66 chi3=4.00 \
+  nc300=1.66e18 nv300=8.8e18 mun=3900 mup=1900
+
 material name=GAAS
   permittivity=12.9 eg300=1.42 chi3=4.07 \
   nc300=4.7e17 nv300=7.0e18 mun=8500 mup=400
 
+material name=INP
+  permittivity=12.5 eg300=1.35 chi3=4.38 \
+  nc300=5.7e17 nv300=1.1e19 mun=5400 mup=160
+
+material name=SIC_4H
+  permittivity=9.7 eg300=3.26 chi3=4.0 \
+  nc300=1.7e19 nv300=1.7e19 mun=800 mup=400
+
+material name=GAN
+  permittivity=8.9 eg300=3.49 chi3=4.1 \
+  nc300=2.3e18 nv300=1.4e19 mun=1000 mup=100
+
 material name=TIO2
   permittivity=10.0 eg300=3.2 chi3=4.0 \
   nc300=5e20 nv300=5e20 mun=0.1 mup=0.01
+
+material name=SIO2
+  permittivity=3.9 eg300=9.0 chi3=0.95 \
+  nc300=1e20 nv300=1e20 mun=0.2 mup=0.01
+
+material name=SI3N4
+  permittivity=7.0 eg300=5.0 chi3=2.1 \
+  nc300=1e20 nv300=1e20 mun=0.1 mup=0.01
+
+material name=AL2O3
+  permittivity=9.0 eg300=6.8 chi3=2.1 \
+  nc300=1e20 nv300=1e20 mun=0.1 mup=0.01
+
+material name=HFO2
+  permittivity=22.0 eg300=5.7 chi3=2.3 \
+  nc300=1e20 nv300=1e20 mun=0.1 mup=0.01
 
 material name=FTO
   permittivity=9.0 eg300=3.7 chi3=4.2 \
@@ -31,5 +69,29 @@ material name=AU
   nc300=1e22 nv300=1e22 mun=100 mup=80
 
 material name=AG
+  permittivity=1.0 eg300=1.0 chi3=4.3 \
+  nc300=1e22 nv300=1e22 mun=100 mup=80
+
+material name=AL
+  permittivity=1.0 eg300=1.0 chi3=4.2 \
+  nc300=1e22 nv300=1e22 mun=100 mup=80
+
+material name=CU
+  permittivity=1.0 eg300=1.0 chi3=4.7 \
+  nc300=1e22 nv300=1e22 mun=100 mup=80
+
+material name=W
+  permittivity=1.0 eg300=1.0 chi3=4.6 \
+  nc300=1e22 nv300=1e22 mun=100 mup=80
+
+material name=PT
+  permittivity=1.0 eg300=1.0 chi3=5.3 \
+  nc300=1e22 nv300=1e22 mun=100 mup=80
+
+material name=NI
+  permittivity=1.0 eg300=1.0 chi3=5.2 \
+  nc300=1e22 nv300=1e22 mun=100 mup=80
+
+material name=TI
   permittivity=1.0 eg300=1.0 chi3=4.3 \
   nc300=1e22 nv300=1e22 mun=100 mup=80

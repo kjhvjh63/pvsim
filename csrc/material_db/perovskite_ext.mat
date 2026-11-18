@@ -22,3 +22,31 @@ material name=NIO
 material name=SNO2
   permittivity=9.0 eg300=3.6 chi3=4.0 \
   nc300=1e20 nv300=1e20 mun=10 mup=1
+
+material name=FABI
+  permittivity=24.0 eg300=1.48 chi3=3.90 \
+  nc300=2.2e18 nv300=1.0e19 mun=2.0 mup=2.0 taun0=2e-8 taup0=2e-8
+
+material name=CSFAMA
+  permittivity=24.0 eg300=1.55 chi3=3.93 \
+  nc300=2.2e18 nv300=1.0e19 mun=2.0 mup=2.0 taun0=1e-8 taup0=1e-8
+
+material name=PTAA
+  permittivity=3.8 eg300=3.4 chi3=2.0 \
+  nc300=1e19 nv300=1e19 mun=1e-5 mup=1e-4
+
+material name=PCBM
+  permittivity=3.9 eg300=1.6 chi3=3.7 \
+  nc300=1e18 nv300=1e18 mun=0.1 mup=1e-4
+
+material name=BCP
+  permittivity=3.3 eg300=2.7 chi3=2.5 \
+  nc300=1e18 nv300=1e18 mun=1e-4 mup=1e-4
+
+material name=LIOF
+  permittivity=2.6 eg300=10.0 chi3=1.0 \
+  nc300=1e20 nv300=1e20 mun=1e-5 mup=1e-5
+
+material name=PEDOT
+  permittivity=3.0 eg300=1.0 chi3=5.0 \
+  nc300=1e20 nv300=1e20 mun=0.01 mup=1.0

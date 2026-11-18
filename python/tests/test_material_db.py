@@ -141,11 +141,14 @@ section("随仓库附带的 .mat")
 
 check("material_db 目录存在", MAT_DIR.is_dir(), str(MAT_DIR))
 shipped = MaterialDb.from_directory(MAT_DIR)
-check("两个文件共 12 种材料", len(shipped) == 12, str(len(shipped)))
+check("两个文件共 33 种材料", len(shipped) == 33, str(len(shipped)))
 check("含硅/GaAs 等通用材料",
-      {"SI", "GAAS", "TIO2", "FTO", "ITO", "AU", "AG"} <= set(shipped.keys()))
+      {"SI", "GE", "GAAS", "INP", "SIC_4H", "GAN", "TIO2", "SIO2", "SI3N4",
+       "AL2O3", "HFO2", "FTO", "ITO", "AU", "AG", "AL", "CU", "W", "PT",
+       "NI", "TI"} <= set(shipped.keys()))
 check("含钙钛矿扩展材料",
-      {"MAPBI3", "SPIRO", "C60", "NIO", "SNO2"} <= set(shipped.keys()))
+      {"MAPBI3", "FABI", "CSFAMA", "SPIRO", "PTAA", "C60", "PCBM", "BCP",
+       "LIOF", "PEDOT", "NIO", "SNO2"} <= set(shipped.keys()))
 
 mapi = shipped.get("MAPBI3").as_dict()
 check("MAPBI3 带隙 1.6", mapi["Eg_eV"] == 1.6)
@@ -158,7 +161,7 @@ check("所有参数都是 LayerSpec 字段",
       all(set(s.as_dict()) <= allowed for s in shipped), str(shipped.keys()))
 
 check("load_file 返回条数",
-      MaterialDb().load_file(MAT_DIR / "silvaco.mat") == 7)
+      MaterialDb().load_file(MAT_DIR / "silvaco.mat") == 21)
 check("重复加载同名材料报错",
       isinstance(_try(lambda: MaterialDb.from_files(
           MAT_DIR / "silvaco.mat", MAT_DIR / "silvaco.mat"), ValueError),
