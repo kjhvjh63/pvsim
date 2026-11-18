@@ -7,7 +7,7 @@
 """
 
 from .app import App, main
-from .editor import DeckEditor, read_deck, write_deck
+from .editor import DeckEditor, classify, read_deck, write_deck
 from .log_panel import (
     LEVEL_DEBUG,
     LEVEL_ERROR,
@@ -35,7 +35,7 @@ from .worker import (
 
 __all__ = [
     "App", "main",
-    "DeckEditor", "read_deck", "write_deck",
+    "DeckEditor", "classify", "read_deck", "write_deck",
     "LogBuffer", "LogPanel", "LogRecord", "format_record",
     "LEVEL_DEBUG", "LEVEL_INFO", "LEVEL_WARN", "LEVEL_ERROR",
     "build_menu_bar", "populate_plot_menu", "plot_menu_tree", "menu_label",

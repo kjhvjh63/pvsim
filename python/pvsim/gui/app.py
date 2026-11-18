@@ -25,6 +25,7 @@ from ..script import DeckCompiler, DeckSyntaxError
 from ..solver import Simulator
 from ..viz import REGISTRY, MissingData, fallback
 from ..viz.registry import PlotRegistry
+from . import dialogs
 from .editor import DeckEditor
 from .log_panel import LogPanel
 from .menu_builder import build_menu_bar
@@ -89,6 +90,9 @@ class App(tk.Tk):
             on_open=self.open_deck, on_save=self.save_deck,
             on_run=self.run_current, on_plot=self.draw,
             on_quit=self.close,
+            on_mesh=self.edit_mesh, on_physics=self.edit_physics,
+            on_solve=self.edit_solve, on_output=self.edit_output,
+            examples=self._example_decks(), on_example=self.load_example,
         )
         self.configure(menu=menubar)
 
@@ -124,6 +128,7 @@ class App(tk.Tk):
         paned.add(left, weight=2)
 
         right = ttk.Notebook(paned)
+        self.notebook = right
         plot_tab = ttk.Frame(right)
         self.figure = Figure(figsize=(6.4, 4.4), dpi=100)
         self.canvas = FigureCanvasTkAgg(self.figure, master=plot_tab)
@@ -131,6 +136,33 @@ class App(tk.Tk):
         self._nav = NavigationToolbar2Tk(self.canvas, plot_tab)
         self._nav.update()
         right.add(plot_tab, text="绘图")
+
+        # 结构树：对应 DeckBuild 的 deck 层栈视图
+        struct_tab = ttk.Frame(right)
+        self.structure_tree = ttk.Treeview(
+            struct_tab, columns=("num", "material", "thick", "doping", "contact"),
+            show="headings", height=8)
+        for col, label, width in (("num", "#", 36),
+                                  ("material", "材料", 120),
+                                  ("thick", "厚度 (nm)", 90),
+                                  ("doping", "掺杂 (cm⁻³)", 110),
+                                  ("contact", "电极", 50)):
+            self.structure_tree.heading(col, text=label)
+            self.structure_tree.column(col, width=width, anchor="w")
+        self.structure_tree.pack(fill=tk.BOTH, expand=True)
+        right.add(struct_tab, text="结构")
+
+        # 结果表：对应 DeckBuild / TonyPlot 的曲线数据表
+        result_tab = ttk.Frame(right)
+        self.result_tree = ttk.Treeview(
+            result_tab, columns=("v", "j", "conv"), show="headings", height=8)
+        for col, label, width in (("v", "V (V)", 90),
+                                  ("j", "J (mA/cm²)", 120),
+                                  ("conv", "收敛", 70)):
+            self.result_tree.heading(col, text=label)
+            self.result_tree.column(col, width=width, anchor="w")
+        self.result_tree.pack(fill=tk.BOTH, expand=True)
+        right.add(result_tab, text="结果")
 
         log_tab = ttk.Frame(right)
         self.log_panel = LogPanel(log_tab, height=12)
@@ -191,6 +223,93 @@ class App(tk.Tk):
         except OSError as exc:
             self.log(_LOG_ERROR, f"保存失败：{exc}")
 
+    def _example_decks(self) -> List[Any]:
+        """工作区 decks/*.tst，做成"帮助 → 示例 deck"菜单项。"""
+        folder = self.workspace / "decks"
+        if not folder.is_dir():
+            return []
+        return [(p.name, str(p)) for p in sorted(folder.glob("*.tst"))]
+
+    def load_example(self, path: str) -> None:
+        try:
+            self.editor.load(Path(path))
+            self.log(_LOG_INFO, f"已加载示例：{path}")
+        except OSError as exc:
+            self.log(_LOG_ERROR, f"加载示例失败：{exc}")
+
+    # ------------------------------------------------------------------
+    # DeckBuild 风格参数对话框：改完直接回写 deck 文本
+    # ------------------------------------------------------------------
+    def _apply_edits(self, replacements: Any, label: str) -> None:
+        text = dialogs.replace_statements(self.editor.get_text(), replacements)
+        self.editor.set_text(text)
+        self.log(_LOG_INFO, f"{label}已写入 deck")
+
+    def edit_mesh(self) -> None:
+        cur = dialogs.current_values(self.editor.get_text())
+        data = dialogs.ask_mesh(self, cur)
+        if data is None:
+            return
+        lines = dialogs.build_mesh_stmt(
+            data["nodes"], data["refine"], data["space_mult"], data["temperature"])
+        self._apply_edits([(("mesh",), lines)], "网格设置")
+
+    def edit_physics(self) -> None:
+        cur = dialogs.current_values(self.editor.get_text())
+        data = dialogs.ask_physics(self, cur)
+        if data is None:
+            return
+        stmts = dialogs.build_physics_stmts(
+            data["models"], data["intensity"], data["bounces"],
+            data["bandgap_mask"])
+        self._apply_edits([(("models",), stmts["models"]),
+                           (("optics",), stmts["optics"])], "物理模型")
+
+    def edit_solve(self) -> None:
+        cur = dialogs.current_values(self.editor.get_text())
+        data = dialogs.ask_solve(self, cur)
+        if data is None:
+            return
+        stmts = dialogs.build_solve_stmts(
+            data["method"], data["maxiter"], data["tol"], data["damping"],
+            data["v_start"], data["v_stop"], data["v_step"])
+        self._apply_edits([(("method",), stmts["method"]),
+                           (("solve",), stmts["solve"])], "求解设置")
+
+    def edit_output(self) -> None:
+        cur = dialogs.current_values(self.editor.get_text())
+        data = dialogs.ask_output(self, cur)
+        if data is None:
+            return
+        lines = dialogs.build_output_stmt(data["fields"], data["format"],
+                                          data["run"])
+        self._apply_edits([(("output",), lines)], "输出设置")
+
+    # ------------------------------------------------------------------
+    # 右侧表格
+    # ------------------------------------------------------------------
+    def _refresh_structure(self) -> None:
+        tree = self.structure_tree
+        tree.delete(*tree.get_children())
+        if self.spec is None:
+            return
+        for i, layer in enumerate(self.spec.device.layers, start=1):
+            doping = (f"Nd={layer.Nd_cm3:g}" if layer.Nd_cm3 > 0 else
+                      f"Na={layer.Na_cm3:g}" if layer.Na_cm3 > 0 else "本征")
+            tree.insert("", tk.END, values=(
+                i, layer.material, f"{layer.thick_nm:g}", doping,
+                "是" if layer.is_contact else ""))
+
+    def _refresh_results(self) -> None:
+        tree = self.result_tree
+        tree.delete(*tree.get_children())
+        points = getattr(self.result, "points", None) or ()
+        for p in points:
+            tree.insert("", tk.END, values=(
+                f"{getattr(p, 'V', 0.0):.3f}",
+                f"{getattr(p, 'J_mA_cm2', 0.0):.4f}",
+                "是" if getattr(p, "converged", False) else "否"))
+
     # ------------------------------------------------------------------
     # 求解
     # ------------------------------------------------------------------
@@ -209,6 +328,7 @@ class App(tk.Tk):
             return
 
         n_points = max(1, int(self.spec.sweep.n_points))
+        self._refresh_structure()
         self.log(_LOG_INFO,
                  f"编译通过：{len(self.spec.device.layers)} 层 / "
                  f"{n_points} 个偏压点 / {self.spec.output.run_name}")
@@ -246,6 +366,7 @@ class App(tk.Tk):
             self._status.set(f"求解中… {event.index + 1}/{event.total}  {event.payload}")
         elif event.kind == EVT_DONE:
             self.result = event.payload
+            self._refresh_results()
             self._progress.configure(
                 value=float(self._progress.cget("maximum")))
             summary = getattr(event.payload, "summary", None)
