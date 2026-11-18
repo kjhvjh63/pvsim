@@ -157,16 +157,29 @@ static void node_dens(const pvk_model* m, int i, const double* u,
     *pout = m->Nv[i] * exp(ep);
 }
 
-/* 连续方程行的归一尺度：max(全器件源项尺度, 当地通量/hc)。
+/* 连续方程行的归一尺度：max(本载流子边通量, 总电流, 全器件源项)/hc。
  *
  * 只除以当地载流子密度 n 时，接触积累层/异质结附近 n 可达 1e16–1e20，
  * SG 通量（~n·Vt/h）的 double 舍入噪声折算成相对残差就是 O(1)–O(10)，
  * Newton 永远压不下去（暗态 refine>0 停在 rel≈0.15 的根因）。改用
  * “电流守恒”的相对量纲：|div J - src| 与 |J|/hc 比较，舍入噪声只有
- * ~1e-10，物理不平衡仍是 O(1)。缩放因子恒正，不改变方程的根。 */
-static double cont_scale(double jR, double jL, double hc, double smax) {
-    double s = fmax(fabs(jR), fabs(jL)) / hc;
-    if (smax > s) s = smax;
+ * ~1e-10，物理不平衡仍是 O(1)。缩放因子恒正，不改变方程的根。
+ *
+ * 源项取**全器件** max(|R|,|G|,ni/τeff)（不是逐行）：高注入/正偏大电流区
+ * 少数载流子行的 SG 一阶截断误差本身就是 O(R)，逐行尺度会把它判成不
+ * 收敛（800 nm 卡 0.62–2.0 V，rel≈0.1 停滞）。ni/τeff 是暗态零偏
+ * （R≡G≡0）时唯一非零的量纲。
+ *
+ * 总电流项是关键：中性区里电流几乎全由多数载流子承担，少数载流子行的
+ * 自通量可以比它小十几个数量级；只用自通量归一，该行在低光下的截断
+ * 误差会被放大成 O(1)（800 nm 0.1 mW 卡在 rel≈0.2，节点 106 的空穴行）。 */
+static double cont_scale(double jSelfR, double jSelfL,
+                         double jTotR, double jTotL,
+                         double hc, double src_scale) {
+    double s = fmax(fabs(jSelfR), fabs(jSelfL)) / hc;
+    double jt = fmax(fabs(jTotR), fabs(jTotL)) / hc;
+    if (jt > s) s = jt;
+    if (src_scale > s) s = src_scale;
     if (!(s > 0.0) || !isfinite(s)) return 1.0;
     return s;
 }
@@ -221,26 +234,24 @@ static double residual(const pvk_model* m, const double* u, double* r,
      * "按真实方程算"的最大相对不平衡度。塌缩解（全层钉扎）靠删方程
      * 让 rel/rn 同时假收敛，但隐藏行的物理不平衡仍是 O(1)，用它识破。 */
     double hidden = 0.0;
+    int hid_node = -1, hid_kind = 0;      /* 隐藏行峰值位置（PVK_DEBUG 诊断） */
+    double hid_num = 0.0, hid_scale = 0.0;
     /* 被排除的两端界面行按真实方程算的最大不平衡度。只做诊断：它随 1/h
      * 增长（实测 101→397 为 1.3e-3→6.1e-2），拿来当收敛门槛会把正常点
      * 全部拒掉，所以不参与判据。 */
     double iface_diag = 0.0;
 
-    /* 全器件源项尺度：用来把"两边都接近 0、纯数值噪声"的行排除在
-     * 相对残差之外（禁带很宽的传输层里 ni/τeff 小到没有意义）。
-     * 下面连续方程按 max(smax, 当地通量/hc) 归一，所以每次调用都要算。 */
+    /* 全器件源项尺度：max over nodes of max(|R|,|G|,ni/τeff)，见 cont_scale。
+     * 取 R 是为了暗态正偏时也有物理量纲（中性区 R 比 ni/τeff 大十几个
+     * 数量级）；保留 ni/τeff 是因为暗态零偏（平衡态）R≡G≡0，完全没有
+     * 下限时 cont_scale 会退回 1.0，舍入噪声把 rel 撑到 O(1)。 */
     double smax = 0.0;
     for (int i = 0; i < n; i++) {
         double t = 1.0 / (1.0 / m->taun[i] + 1.0 / m->taup[i]);
-        double s = fabs(m->G[i]) + m->ni[i] / t;
+        double s = fmax(fabs(rnet[i]), fabs(m->G[i]));
+        if (m->ni[i] / t > s) s = m->ni[i] / t;
         if (s > smax) smax = s;
     }
-    /* 暗态/低光时上面的尺度只剩 ni/τ，比多数载流子的复合量级小十一
-     * 个数量级；而中性区里 p=4e16 的 SG 通量（~p·Vt/h）的 double 舍入
-     * 就有 ~1e15 cm⁻³s⁻¹，缩放残差因此有 1e3~1e4 的地板，rn 永远压不到
-     * tol（0.01/0.1 mW/cm² 实测 0/101）。这个地板交给牛顿迭代里的
-     * "步长判据"处理（见 dumax），不要在这里放大尺度——放大后会提前
-     * 放行半收敛解，1 mW/cm² 的 Jsc 会被算错 1.9 倍。 */
 
     /* 两端紧邻接触层的**两个**自由节点的连续性行不参与判据。
      * 理想 Ohmic 金属侧的载流子密度与体内相差十几个数量级，中间积累层
@@ -390,55 +401,61 @@ static double residual(const pvk_model* m, const double* u, double* r,
                 r[n + i] = u[n + i] - u[2*n + i];
                 REL_ACC_K(r[n + i], 3);
                 if (hidden_out && !iface_row) {
-                    double hp = fabs((jnR - jnL) / hc - src)
-                                / cont_scale(jnR, jnL, hc, smax);
+                    double sc = cont_scale(jnR, jnL, jnR + jpR, jnL + jpL, hc, smax);
+                    double hp = fabs((jnR - jnL) / hc - src) / sc;
                     if (!isfinite(hp)) hp = 1e6;
-                    if (hp > hidden) hidden = hp;
+                    if (hp > hidden) {
+                        hidden = hp; hid_node = i; hid_kind = 1;
+                        hid_num = fabs((jnR - jnL) / hc - src); hid_scale = sc;
+                    }
                 }
             }
             if (p_deg) {
                 r[2 * n + i] = u[2*n + i] - u[n + i];
                 REL_ACC_K(r[2*n + i], 4);
                 if (hidden_out && !iface_row) {
-                    double hp = fabs((jpR - jpL) / hc + src)
-                                / cont_scale(jpR, jpL, hc, smax);
+                    double sc = cont_scale(jpR, jpL, jnR + jpR, jnL + jpL, hc, smax);
+                    double hp = fabs((jpR - jpL) / hc + src) / sc;
                     if (!isfinite(hp)) hp = 1e6;
-                    if (hp > hidden) hidden = hp;
+                    if (hp > hidden) {
+                        hidden = hp; hid_node = i; hid_kind = 2;
+                        hid_num = fabs((jpR - jpL) / hc + src); hid_scale = sc;
+                    }
                 }
             }
             if (!e_deg) {
                 double den = nbuf[i] > 1e-280 ? nbuf[i] : 1e-280;
                 r[n + i] = ((jnR - jnL) / hc - src) / den;
                 { double rc = fabs((jnR - jnL) / hc - src)
-                                  / cont_scale(jnR, jnL, hc, smax);
+                                  / cont_scale(jnR, jnL, jnR + jpR, jnL + jpL, hc, smax);
                   if (!iface_row) REL_ACC_K(rc, 1); }
             }
             if (!p_deg) {
                 double den = pbuf[i] > 1e-280 ? pbuf[i] : 1e-280;
                 r[2 * n + i] = ((jpR - jpL) / hc + src) / den;
                 { double rc = fabs((jpR - jpL) / hc + src)
-                                  / cont_scale(jpR, jpL, hc, smax);
+                                  / cont_scale(jpR, jpL, jnR + jpR, jnL + jpL, hc, smax);
                   if (!iface_row) REL_ACC_K(rc, 2); }
             }
         } else {
             double den_n = nbuf[i] > 1e-280 ? nbuf[i] : 1e-280;
             r[n + i] = ((jnR - jnL) / hc - src) / den_n;
             { double rc = fabs((jnR - jnL) / hc - src)
-                              / cont_scale(jnR, jnL, hc, smax);
+                              / cont_scale(jnR, jnL, jnR + jpR, jnL + jpL, hc, smax);
               if (!iface_row) REL_ACC_K(rc, 1); }
             double den_p = pbuf[i] > 1e-280 ? pbuf[i] : 1e-280;
             r[2 * n + i] = ((jpR - jpL) / hc + src) / den_p;
             { double rc = fabs((jpR - jpL) / hc + src)
-                              / cont_scale(jpR, jpL, hc, smax);
+                              / cont_scale(jpR, jpL, jnR + jpR, jnL + jpL, hc, smax);
               if (!iface_row) REL_ACC_K(rc, 2); }
         }
 
         /* 被排除的界面行：只记诊断值（归一尺度与 REL_ACC 相同） */
         if (iface_row) {
             double rcn = fabs((jnR - jnL) / hc - src)
-                       / cont_scale(jnR, jnL, hc, smax);
+                       / cont_scale(jnR, jnL, jnR + jpR, jnL + jpL, hc, smax);
             double rcp = fabs((jpR - jpL) / hc + src)
-                       / cont_scale(jpR, jpL, hc, smax);
+                       / cont_scale(jpR, jpL, jnR + jpR, jnL + jpL, hc, smax);
             double rc = fmax(rcn, rcp);
             if (!isfinite(rc)) rc = 1e6;
             if (rc > iface_diag) iface_diag = rc;
@@ -472,6 +489,14 @@ static double residual(const pvk_model* m, const double* u, double* r,
                     iface_diag);
     }
     if (hidden_out) *hidden_out = hidden;
+    if (getenv("PVK_DEBUG") && hidden > 1e-2 && hid_node >= 0) {
+        fprintf(stderr,
+                "[pvk] hid=%.3e node=%d layer=%d kind=%d x=%.2f nm "
+                "n=%.3g p=%.3g num=%.3e scale=%.3e\n",
+                hidden, hid_node, m->node_layer[hid_node], hid_kind,
+                m->x[hid_node] * 1e7, nbuf[hid_node], pbuf[hid_node],
+                hid_num, hid_scale);
+    }
     if (getenv("PVK_DEBUG") && rmax > 1e-1 && rmax_i >= 0) {
         fprintf(stderr,
                 "[pvk] rmax=%.3e node=%d layer=%d kind=%d x=%.2f nm n=%.3g p=%.3g\n",
@@ -1205,7 +1230,13 @@ static int solve_newton(pvk_model* m, double* u,
          *   * 抬高 smax 到 1e-3*(净掺杂/tau)：1 mW/cm2 的 Jsc 会错 1.9 倍；
          *   * 步长判据 dumax<1e-6：1 mW/cm2 正确，但 0.1/0.01 mW/cm2 会停在
          *     错误解上（Jsc 偏小 1.5 倍、Voc 反而更高）。
-         * 两者都不可接受，已回退；低光收敛要从方程尺度化入手。 */
+         * 两者都不可接受，已回退。根因是源项尺度取了全器件最大值（暗态
+         * 只剩 ni/τ）；现在改成 max(|R|,|G|) 并用总电流通量 |Jn+Jp|/hc
+         * 参与归一（见 cont_scale）。
+         * 另外试过"终端电流连续 2 次迭代相对变化 <1e-4"作为第二判据：
+         * 端电流取自接触层旁的交界边，SG 一阶截断误差给它的噪声地板就是
+         * 1e-5~1e-4（1 mW 的 V=0 实测 1.4e-5），正常收敛点会被大面积拒掉
+         * （800 nm 1 sun 从 80/101 掉到 44/101），不可用。 */
 
         /* 物理判据提前放行：通量相对残差（局部电流守恒/泊松/边界）已经
          * < 1e-3 时，2-范数可能仍被"按 n 或 p 归一"的少数载流子行撑在
