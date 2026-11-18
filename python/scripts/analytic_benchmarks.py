@@ -152,6 +152,25 @@ def main() -> int:
           abs(abs(j15_coarse) - abs(j15_fine)) / abs(j15_fine) < 0.2,
           f"Jsc(101)={j15_coarse:.4f}, Jsc(201)={j15_fine:.4f}")
 
+    print("9. Atlas 2D 对齐锚点（Cs2AgBiBr6 800nm 复刻卡）")
+    # 参考值来自本机 Silvaco Atlas（decks/atlas2d_800nm.in，1 sun）：
+    # Jsc 27.27 / Voc 1.1822 / FF 0.810。复跑方式见 scripts/atlas_reference.py。
+    # 容差按"物理口径一致、数值差异可解释"设定：Jsc 5%（亚带隙吸收口径）、
+    # Voc 100 mV、FF 0.10（当前实测 +45 mV / +0.02）。
+    ref_deck = (Path(__file__).resolve().parents[2] / "decks" /
+                "cs2agbibr6_800nm_ref.tst")
+    r9 = Simulator().run(DeckCompiler().compile_text(
+        ref_deck.read_text(encoding="utf-8"))).jv
+    AT_JSC, AT_VOC, AT_FF = 27.27, 1.1822, 0.810
+    check("Jsc 与 Atlas 差 <5%", abs(r9.Jsc - AT_JSC) / AT_JSC < 0.05,
+          f"ours={r9.Jsc:.2f}, atlas={AT_JSC:.2f}")
+    check("Voc 与 Atlas 差 <100 mV",
+          np.isfinite(r9.Voc) and abs(r9.Voc - AT_VOC) < 0.10,
+          f"ours={r9.Voc:.4f}, atlas={AT_VOC:.4f}")
+    check("FF 与 Atlas 差 <0.10",
+          np.isfinite(r9.FF) and abs(r9.FF - AT_FF) < 0.10,
+          f"ours={r9.FF:.4f}, atlas={AT_FF:.4f}")
+
     print("\n参考曲线（供外部对照）")
     for inten in (10.0, 50.0, 100.0):
         r = run(intensity=inten).jv
