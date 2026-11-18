@@ -104,6 +104,9 @@ typedef struct {
      * 这些节点的连续性行换成 φn/φp = 接触值（欧姆接触的无限复合），
      * Poisson 仍求解。用于接触积累层远细于网格的情形（见 mark_contact_layer）。 */
     unsigned char* cpl;
+    /* 接触层掩码一旦在冷启动（平衡态）确定就冻结：否则偏压变化会让
+     * 掩码随 ψ 漂移，方程组在不同偏压间切换，结果不可复现。 */
+    int cpl_frozen;
 
     double  u_bc[2];
     double  wn_bc[2];
@@ -696,6 +699,7 @@ static int model_init(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
         return PVK_EMEM;
     }
     memset(m->cpl, 0, sizeof(unsigned char) * (size_t)n);
+    m->cpl_frozen = 0;
 
     const double* gopt = ctx->state.fields[PVK_FIELD_G_OPT];
 
@@ -813,6 +817,33 @@ static int model_init(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
 /* ─────────────────────────────────────────────────────────────────────
  * Newton
  * ───────────────────────────────────────────────────────────────────── */
+
+/* 收敛失败诊断：打印违反最大的 3 行（仅 PVK_DEBUG=1）。 */
+static void dump_worst_rows(const pvk_model* m, const double* r,
+                            const double* u, int nn) {
+    int n = m->n;
+    int picked[3] = { -1, -1, -1 };
+    for (int k = 0; k < 3; k++) {
+        int worst = -1;
+        double wv = -1.0;
+        for (int i = 0; i < nn; i++) {
+            int skip = 0;
+            for (int q = 0; q < k; q++) if (picked[q] == i) { skip = 1; break; }
+            if (skip) continue;
+            double v = fabs(r[i]);
+            if (v > wv) { wv = v; worst = i; }
+        }
+        if (worst < 0) break;
+        picked[k] = worst;
+        int t = worst / n, node = worst % n;
+        double nv = 0.0, pv = 0.0;
+        node_dens(m, node, u, &nv, &pv);
+        fprintf(stderr, "[pvk]   worst %s node=%d x=%.4g nm |r|=%.3e n=%.3e p=%.3e\n",
+                t == 0 ? "psi " : (t == 1 ? "phin" : "phip"),
+                node, m->x[node] * 1e7, wv, nv, pv);
+    }
+}
+
 static int solve_newton(pvk_model* m, double* u,
                         const pvk_solver_opts* opts, pvk_solve_info* out) {
     const int n = m->n;
@@ -970,6 +1001,12 @@ static int solve_newton(pvk_model* m, double* u,
                 fprintf(stderr, "[pvk] 步长停滞但 rel=%.3e，判为未收敛\n", rel_now);
             break;
         }
+    }
+
+    if (!converged && getenv("PVK_DEBUG")) {
+        fprintf(stderr, "[pvk] not converged: status=%d iters=%d rn=%.3e\n",
+                status, iters, rn);
+        if (isfinite(rn)) dump_worst_rows(m, r, u, nn);
     }
 
     /* 诊断输出：最终解的无量纲相对不平衡度（判据见循环尾部）。 */
@@ -1392,7 +1429,8 @@ static void initial_guess(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
                 u[n + i]   = m->wn_bc[e];
                 u[2*n + i] = m->wp_bc[e];
             }
-            mark_contact_layer(m, u);
+            /* 掩码在首次冷启动时按平衡态冻结，暖启动只套用，不重算 */
+            if (!m->cpl_frozen) mark_contact_layer(m, u);
             apply_contact_layer_qfl(m, u);
             return;
         }
@@ -1443,6 +1481,7 @@ static void initial_guess(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
     }
 
     mark_contact_layer(m, u);
+    m->cpl_frozen = 1;
     apply_contact_layer_qfl(m, u);
 }
 
