@@ -11,17 +11,20 @@
 语句子集（Atlas 风格，详见 ``docs/deck_syntax.md``）::
 
     title <自由文本>
-    mesh nodes=101 interface.refine=1.0 space.mult=1.0
-    region num=1 material=FTO thickness=200
-    doping region=1 n.type conc=1e20
-    contact name=anode workfunction=4.7
+    mesh nodes=101 interface.refine=1.0 space.mult=1.0      # 或 nx=101
+    region num=1 material=FTO thickness=200                 # 或 x.min=0 x.max=0.2（µm）
+    doping region=1 uniform n.type conc=1e20
+    contact/electrode name=anode workfunction=4.7
     material name=MAPBI3 eg=1.6 taun=8e-9
     models srh
     optics spectrum=am15g intensity=100 bounces=1 bandgap.mask
     method newton maxiter=60 tol=1e-8 damping=1.0
-    solve vstart=0 vfinal=1.8 vstep=0.05
+    solve vstart=0 vfinal=1.8 vstep=0.05                    # 或 vanode=
     log file=out/jv.log
-    output fields=X,PSI,N,P,EFIELD,JTOTAL,G_OPT run=mapbi3
+    save outfile=out/struct.str                             # 只解析，落盘由 dataio 负责
+    output con.band val.band j.total                        # 或 fields=X,PSI,...
+    extract ...                                             # 兼容接受，提示未实现
+    comment/go/quit/plot/tonyplot ...                       # 兼容接受，无副作用
 """
 
 from __future__ import annotations
@@ -199,11 +202,14 @@ def _field_list(values: ValueMap, key: str) -> Tuple[str, ...]:
 def _p_mesh(values: ValueMap, flags: List[str], word: Token,
             warnings: List[str]) -> ast.MeshStmt:
     _reject_unknown(values, flags,
-                    ("nodes", "refine", "interface.refine", "space.mult",
-                     "space", "temperature", "temp"),
+                    ("nodes", "nx", "ny", "refine", "interface.refine",
+                     "space.mult", "space", "temperature", "temp"),
                     word.line, warnings, "mesh")
+    if _get(values, "ny") is not None and _get(values, "nx") is None \
+            and _get(values, "nodes") is None:
+        warnings.append(f"L{word.line}: mesh 只支持 1D，ny= 已忽略")
     return ast.MeshStmt(
-        nodes=_int(values, "nodes"),
+        nodes=_int(values, "nodes", "nx"),
         refine=_num(values, "refine", "interface.refine"),
         space_mult=_num(values, "space.mult", "space"),
         temperature=_num(values, "temperature", "temp"),
@@ -214,7 +220,8 @@ def _p_mesh(values: ValueMap, flags: List[str], word: Token,
 def _p_region(values: ValueMap, flags: List[str], word: Token,
               warnings: List[str]) -> ast.RegionStmt:
     _reject_unknown(values, flags,
-                    ("num", "number", "material", "thickness", "thick", "name"),
+                    ("num", "number", "material", "thickness", "thick", "name",
+                     "x.min", "xmax", "x.max", "xmin"),
                     word.line, warnings, "region")
     material = _word(values, "material")
     if material is None:
@@ -224,6 +231,8 @@ def _p_region(values: ValueMap, flags: List[str], word: Token,
         thickness_nm=_num(values, "thickness", "thick"),
         number=_int(values, "num", "number"),
         name=_word(values, "name"),
+        x_min_nm=_num(values, "x.min", "xmin"),
+        x_max_nm=_num(values, "x.max", "xmax"),
         line=word.line,
     )
 
@@ -232,8 +241,17 @@ def _p_doping(values: ValueMap, flags: List[str], word: Token,
               warnings: List[str]) -> ast.DopingStmt:
     _reject_unknown(values, flags,
                     ("region", "conc", "concentration", "doping",
-                     "nd", "na", "type", "n.type", "p.type"),
+                     "nd", "na", "type", "n.type", "p.type",
+                     "uniform", "gaussian", "erfc"),
                     word.line, warnings, "doping")
+
+    # 1D 内核只支持均匀掺杂；gaussian/erfc 明确提示"按均匀近似"，
+    # 而不是静默给出与 Atlas 不同的物理。
+    for profile in ("gaussian", "erfc"):
+        if profile in flags:
+            warnings.append(
+                f"L{word.line}: doping {profile} 未实现，按 uniform 均匀掺杂处理"
+            )
 
     kind = None
     conc = None
@@ -265,9 +283,10 @@ def _p_doping(values: ValueMap, flags: List[str], word: Token,
 
 def _p_contact(values: ValueMap, flags: List[str], word: Token,
                warnings: List[str]) -> ast.ContactStmt:
+    # x.min/x.max 是 Atlas 电极写法；1D 下电极位置由层栈首/末决定，忽略即可
     _reject_unknown(values, flags,
                     ("name", "region", "voltage", "bias", "workfunction",
-                     "work.function", "workfun"),
+                     "work.function", "workfun", "x.min", "x.max", "xmin", "xmax"),
                     word.line, warnings, "contact")
     name = _word(values, "name")
     if name is None:
@@ -358,11 +377,17 @@ def _p_method(values: ValueMap, flags: List[str], word: Token,
 def _p_solve(values: ValueMap, flags: List[str], word: Token,
              warnings: List[str]) -> ast.SolveStmt:
     _reject_unknown(values, flags,
-                    ("vstart", "v.start", "vbegin", "vfinal", "vstop",
-                     "v.stop", "vstep", "dv", "npoints", "n.points", "np", "log"),
+                    ("vstart", "v.start", "vbegin", "vanode", "vfinal", "vstop",
+                     "v.stop", "vcathode", "vstep", "dv", "npoints", "n.points",
+                     "np", "log", "init", "name"),
                     word.line, warnings, "solve")
+    if _get(values, "vcathode") is not None:
+        warnings.append(f"L{word.line}: solve vcathode= 未实现，扫描极固定为 anode")
+    if "init" in flags and _get(values, "vstart", "vanode") is None:
+        # Atlas 的 solve init 只是初始化，本模型在 vstart 处自动冷启动
+        warnings.append(f"L{word.line}: solve init 已忽略（vstart 处自动初始化）")
     return ast.SolveStmt(
-        v_start=_num(values, "vstart", "v.start", "vbegin"),
+        v_start=_num(values, "vstart", "v.start", "vbegin", "vanode"),
         v_stop=_num(values, "vfinal", "vstop", "v.stop"),
         v_step=_num(values, "vstep", "dv"),
         n_points=_int(values, "npoints", "n.points", "np"),
@@ -373,11 +398,13 @@ def _p_solve(values: ValueMap, flags: List[str], word: Token,
 
 def _p_output(values: ValueMap, flags: List[str], word: Token,
               warnings: List[str]) -> ast.OutputStmt:
-    _reject_unknown(values, flags,
-                    ("fields", "field", "run", "run.name", "name", "file", "format"),
+    # Atlas 习惯是把场量写成裸标志：output con.band val.band j.total
+    _reject_unknown(values, (), ("fields", "field", "run", "run.name",
+                                 "name", "file", "format"),
                     word.line, warnings, "output")
     return ast.OutputStmt(
         fields=_field_list(values, "fields") or _field_list(values, "field"),
+        flag_fields=tuple(f.upper() for f in flags),
         run_name=_word(values, "run", "run.name", "name"),
         file=_word(values, "file"),
         format=_word(values, "format"),
@@ -395,11 +422,38 @@ def _p_log(values: ValueMap, flags: List[str], word: Token,
     return ast.LogStmt(path=path, line=word.line)
 
 
+def _p_save(values: ValueMap, flags: List[str], word: Token,
+            warnings: List[str]) -> ast.SaveStmt:
+    _reject_unknown(values, (),
+                    ("file", "outfile", "outf", "path", "name"),
+                    word.line, warnings, "save")
+    path = _word(values, "file", "outfile", "outf", "path", "name")
+    if not path:
+        raise DeckSyntaxError("save 缺少 file= / outfile=", word.line, word.col)
+    return ast.SaveStmt(path=path, line=word.line)
+
+
+def _p_extract(values: ValueMap, flags: List[str], word: Token,
+               warnings: List[str]) -> ast.ExtractStmt:
+    # extract 的语法极其自由（表达式 + 名称），这里不做语义解析，
+    # 只保留少量原文线索，由编译器给出"暂不支持"的提示。
+    parts = [word.value] + list(flags) + [f"{k}=" for k in values]
+    return ast.ExtractStmt(raw=" ".join(parts), line=word.line)
+
+
+def _p_workflow(values: ValueMap, flags: List[str], word: Token,
+                warnings: List[str]) -> ast.WorkflowStmt:
+    """go / quit / plot / tonyplot / comment：兼容接受，无副作用。"""
+    raw = " ".join([word.value] + flags + list(values))
+    return ast.WorkflowStmt(keyword=word.value.lower(), raw=raw, line=word.line)
+
+
 _HANDLERS: Dict[str, Callable[[ValueMap, List[str], Token, List[str]], Any]] = {
     "mesh": _p_mesh,
     "region": _p_region,
     "doping": _p_doping,
     "contact": _p_contact,
+    "electrode": _p_contact,
     "material": _p_material,
     "models": _p_models,
     "model": _p_models,
@@ -408,6 +462,13 @@ _HANDLERS: Dict[str, Callable[[ValueMap, List[str], Token, List[str]], Any]] = {
     "solve": _p_solve,
     "output": _p_output,
     "log": _p_log,
+    "save": _p_save,
+    "extract": _p_extract,
+    "comment": _p_workflow,
+    "go": _p_workflow,
+    "quit": _p_workflow,
+    "plot": _p_workflow,
+    "tonyplot": _p_workflow,
 }
 
 

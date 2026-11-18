@@ -33,9 +33,13 @@ from ..param.schema import (
 from . import ast_nodes as ast
 
 # 电极材料（用于判断首/末层是否挂边界条件）
-CONTACT_MATERIALS = frozenset({"FTO", "ITO", "AZO", "AU", "AG", "AL", "CU", "NI"})
+CONTACT_MATERIALS = frozenset({"FTO", "ITO", "AZO", "AU", "AG", "AL", "CU", "NI",
+                               "W", "PT", "TI", "PEDOT"})
 
-# deck 场量别名 → VALID_FIELDS
+# Atlas 的 x 坐标单位是 µm，本平台层厚单位是 nm
+_UM_TO_NM = 1000.0
+
+# deck 场量别名 → VALID_FIELDS（右列是 Atlas 惯用写法）
 FIELD_ALIASES: Dict[str, str] = {
     "E.FIELD": "EFIELD",
     "ELECTRIC.FIELD": "EFIELD",
@@ -45,11 +49,22 @@ FIELD_ALIASES: Dict[str, str] = {
     "EV": "VB",
     "J": "JTOTAL",
     "J.TOTAL": "JTOTAL",
+    "J.ELECTRON": "JN",
+    "J.HOLE": "JP",
     "R": "R_NET",
+    "SRH": "R_NET",
     "G": "G_OPT",
+    "G.OPT": "G_OPT",
     "PHI.N": "PHIN",
     "PHI.P": "PHIP",
+    "QFN": "PHIN",
+    "QFP": "PHIP",
+    "X.MESH": "X",
+    "CONC": "N",
 }
+
+# 内核当前只实现了 SRH；其余 Atlas 模型名只提示、不改变物理
+_SUPPORTED_MODELS = frozenset({"srh"})
 
 # 内建材料参数（过渡用；数值与 schema.mapbi3_stack 一致）
 BUILTIN_MATERIALS: Dict[str, Dict[str, float]] = {
@@ -94,6 +109,12 @@ class DeckCompiler:
         for warning in deck.warnings:
             self._log(warning)
 
+        self._check_models(deck)
+        for save in deck.of(ast.SaveStmt):
+            self._log(f"save file='{save.path}'：结构/解落盘由 dataio 负责")
+        for ex in deck.of(ast.ExtractStmt):
+            self._log(f"extract 暂不支持（已忽略）：{ex.raw}")
+
         layers, resolved = self._build_layers(deck)
         device = self._build_device(deck, layers)
         spec = ProblemSpec(
@@ -126,6 +147,16 @@ class DeckCompiler:
             if got:
                 return dict(got)
         return dict(BUILTIN_MATERIALS.get(key, {}))
+
+    # ----- 模型 ---------------------------------------------------------
+    def _check_models(self, deck: ast.Deck) -> None:
+        """内核固定在体区解 SRH；其余 Atlas 模型名只提示不生效。"""
+        stmt = deck.last(ast.ModelStmt)
+        if stmt is None:
+            return
+        for name in stmt.models:
+            if name not in _SUPPORTED_MODELS:
+                self._log(f"models '{name}' 未实现，已忽略（当前固定 SRH）")
 
     # ----- 层栈 ---------------------------------------------------------
     def _build_layers(self, deck: ast.Deck) -> Tuple[Tuple[LayerSpec, ...],
@@ -162,14 +193,12 @@ class DeckCompiler:
         layers: List[LayerSpec] = []
         resolved: Dict[str, Dict[str, float]] = {}
         n = len(regions)
+        cursor_nm = 0.0     # Atlas x.max 链式推导出的当前截面位置
 
         for i, region in enumerate(regions):
             num = region.number if region.number is not None else i + 1
-            if region.thickness_nm is None or region.thickness_nm <= 0:
-                raise SpecError(
-                    f"region[{num}] '{region.material}' 缺少正的 thickness=",
-                    details=["厚度单位为 nm"],
-                )
+            thickness_nm, cursor_nm = self._region_thickness(
+                region, cursor_nm, num)
 
             key = region.material.upper()
             params = self._lookup(key)
@@ -192,7 +221,7 @@ class DeckCompiler:
             layers.append(LayerSpec(
                 name=region.name or region.material,
                 material=region.material,
-                thick_nm=float(region.thickness_nm),
+                thick_nm=thickness_nm,
                 is_contact=is_contact,
                 **params,
             ))
@@ -203,6 +232,39 @@ class DeckCompiler:
                           f"'{layer.name}' 作为"
                           f"{'阳极' if i == 0 else '阴极'}挂载点（非典型电极材料）")
         return tuple(layers), resolved
+
+    def _region_thickness(self, region: ast.RegionStmt, cursor_nm: float,
+                          num: int) -> Tuple[float, float]:
+        """算出该层厚度（nm），同时返回下一个 x.max 的游标。
+
+        优先用 ``thickness=``（nm，本平台单位）；没有时按 Atlas 的
+        ``x.min/x.max``（**µm**）推导。Atlas deck 里 x 坐标是微米，
+        这里显式换算，避免把 0.5 µm 误当成 0.5 nm。
+        """
+        if region.thickness_nm is not None:
+            if region.thickness_nm <= 0:
+                raise SpecError(
+                    f"region[{num}] '{region.material}' 缺少正的 thickness=",
+                    details=["厚度单位为 nm"],
+                )
+            return float(region.thickness_nm), cursor_nm + float(region.thickness_nm)
+
+        if region.x_max_nm is None:
+            raise SpecError(
+                f"region[{num}] '{region.material}' 缺少正的 thickness=",
+                details=["厚度单位为 nm；或按 Atlas 风格给 x.min= / x.max=（单位 µm）"],
+            )
+
+        x_hi = float(region.x_max_nm) * _UM_TO_NM
+        x_lo = (float(region.x_min_nm) * _UM_TO_NM
+                if region.x_min_nm is not None else cursor_nm)
+        thick = x_hi - x_lo
+        if thick <= 0:
+            raise SpecError(
+                f"region[{num}] '{region.material}' 的 x.max 必须大于 x.min/上一层右边界",
+                details=[f"x.min={x_lo / _UM_TO_NM:g} µm, x.max={region.x_max_nm:g} µm"],
+            )
+        return thick, x_hi
 
     def _build_device(self, deck: ast.Deck,
                       layers: Tuple[LayerSpec, ...]) -> DeviceSpec:
@@ -324,8 +386,8 @@ class DeckCompiler:
             return default
 
         fields: Tuple[str, ...] = default.fields
+        resolved: List[str] = []
         if stmt.fields:
-            resolved = []
             for raw in stmt.fields:
                 name = FIELD_ALIASES.get(raw.upper(), raw.upper())
                 if name not in VALID_FIELDS:
@@ -334,7 +396,18 @@ class DeckCompiler:
                         details=[f"可用：{', '.join(VALID_FIELDS)}"],
                     )
                 resolved.append(name)
+        # Atlas 习惯的裸标志（output con.band val.band ...）：认识的收下，
+        # 不认识的只提示——真 Atlas deck 里常有本平台没有的量，不能因此编译失败。
+        for raw in stmt.flag_fields:
+            name = FIELD_ALIASES.get(raw, raw)
+            if name in VALID_FIELDS:
+                resolved.append(name)
+            else:
+                self._log(f"output 场量 '{raw}' 未支持，已忽略")
+        if resolved:
             fields = tuple(dict.fromkeys(resolved))   # 去重且保序
+            if "X" not in fields:                     # 网格坐标始终可用，补在最前
+                fields = ("X",) + fields
 
         run_name = stmt.run_name or default.run_name
         fmt = stmt.format.lower() if stmt.format else default.format

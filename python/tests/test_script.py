@@ -198,6 +198,43 @@ check("doping 同时 n/p 抛 DeckSyntaxError",
       isinstance(_try(lambda: parse_deck("doping n.type p.type conc=1e15\n"),
                       DeckSyntaxError), DeckSyntaxError))
 
+# --- Atlas 风格语句（对齐 DeckBuild 常见写法）------------------------------
+ATLAS_TEXT = (
+    "mesh nx=51\n"
+    "region num=1 material=FTO  x.min=0 x.max=0.2\n"
+    "region num=2 material=Au   x.max=0.28\n"
+    "doping region=1 uniform n.type conc=1e20\n"
+    "electrode name=anode x.min=0 x.max=0.2\n"
+    "output con.band val.band j.total qfn\n"
+    "solve vanode=0 vfinal=1.0 vstep=0.5\n"
+    "save outfile=out/struct.str\n"
+    "extract name=\"voc\"\n"
+    "tonyplot file=out/jv.log\n"
+    "go\n"
+    "quit\n"
+)
+atlas = parse_deck(ATLAS_TEXT)
+check("mesh nx= 等价 nodes", atlas.first(ast.MeshStmt).nodes == 51)
+check("region 读取 x.min/x.max",
+      atlas.of(ast.RegionStmt)[0].x_max_nm == 0.2
+      and atlas.of(ast.RegionStmt)[1].x_min_nm is None)
+check("electrode 解析成 contact",
+      len(atlas.of(ast.ContactStmt)) == 1
+      and atlas.first(ast.ContactStmt).name == "anode")
+check("output 裸标志被保留",
+      atlas.first(ast.OutputStmt).flag_fields
+      == ("CON.BAND", "VAL.BAND", "J.TOTAL", "QFN"),
+      str(atlas.first(ast.OutputStmt).flag_fields))
+check("solve vanode= 当起点", atlas.first(ast.SolveStmt).v_start == 0.0)
+check("save 解析", atlas.first(ast.SaveStmt).path == "out/struct.str")
+check("extract 记录原文", len(atlas.of(ast.ExtractStmt)) == 1)
+check("go/quit 不算未知语句", len(atlas.of(ast.UnknownStmt)) == 0)
+check("Atlas 风格无警告", not atlas.warnings, str(atlas.warnings))
+
+gauss = parse_deck("doping region=1 gaussian n.type conc=1e18\n" + MINIMAL)
+check("gaussian 提示按均匀近似",
+      any("gaussian" in w for w in gauss.warnings), str(gauss.warnings))
+
 # ---------------------------------------------------------------------------
 # 3. 编译
 # ---------------------------------------------------------------------------
@@ -249,6 +286,26 @@ check("MaterialSet 记录材料参数",
 
 round_trip = ProblemSpec.from_json(spec.to_json())
 check("JSON round-trip", round_trip.to_dict() == spec.to_dict())
+
+atlas_spec = DeckCompiler().compile(parse_deck(ATLAS_TEXT))
+check("x.max 按 µm 换算成 nm",
+      [l.thick_nm for l in atlas_spec.device.layers] == [200.0, 80.0],
+      str([l.thick_nm for l in atlas_spec.device.layers]))
+check("输出裸标志映射成场量",
+      atlas_spec.output.fields == ("X", "CB", "VB", "JTOTAL", "PHIN"),
+      str(atlas_spec.output.fields))
+check("Atlas deck 无致命问题", not atlas_spec.validate_notes()[0],
+      str(atlas_spec.validate_notes()[0]))
+
+model_msgs = []
+DeckCompiler(log=model_msgs.append).compile_text("models srh auger\n" + MINIMAL)
+check("auger 提示未实现", any("auger" in m for m in model_msgs),
+      str(model_msgs))
+
+save_msgs = []
+DeckCompiler(log=save_msgs.append).compile_text("save outfile=out/a.str\n" + MINIMAL)
+check("save 提示由 dataio 负责", any("save" in m for m in save_msgs),
+      str(save_msgs))
 
 minimal = DeckCompiler().compile_text(MINIMAL)
 check("compile_text 一步到位", len(minimal.device.layers) == 3)
@@ -334,6 +391,24 @@ check("场表形状与网格一致",
       all(arr.shape == (37, result.fields.n_node)
           for arr in result.fields.data.values()))
 check("J-V 数组与点数一致", result.jv.V.size == 37)
+
+# Atlas 风格 deck 与 device_example 结构等价，Jsc 应当一致（脚本兼容验收）
+ATLAS_DECK = ROOT.parent / "decks" / "atlas_style_example.tst"
+check("Atlas 示例 deck 存在", ATLAS_DECK.exists(), str(ATLAS_DECK))
+atlas_compiled = DeckCompiler().compile_text(
+    ATLAS_DECK.read_text(encoding="utf-8"))
+check("Atlas 示例 deck 编译出 5 层",
+      len(atlas_compiled.device.layers) == 5)
+check("x.max 链式厚度与 device_example 一致",
+      [l.thick_nm for l in atlas_compiled.device.layers]
+      == [l.thick_nm for l in spec.device.layers],
+      str([l.thick_nm for l in atlas_compiled.device.layers]))
+atlas_result = Simulator().run(atlas_compiled)
+check("Atlas 示例跑完整扫描", len(atlas_result.points) == 27,
+      str(len(atlas_result.points)))
+check("Atlas 示例 Jsc 与 device_example 一致",
+      abs(atlas_result.jv.Jsc - result.jv.Jsc) < 0.1,
+      f"{atlas_result.jv.Jsc:.4f} vs {result.jv.Jsc:.4f}")
 
 print(f"\n{'='*50}")
 print(f"  {passed} passed, {failed} failed, {passed+failed} total")

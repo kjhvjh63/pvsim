@@ -27,6 +27,8 @@ class RegionStmt:
     thickness_nm: Optional[float] = None
     number:       Optional[int] = None
     name:         Optional[str] = None
+    x_min_nm:     Optional[float] = None   # Atlas 风格：由 x.min/x.max 推厚度
+    x_max_nm:     Optional[float] = None
     line:         int = 0
 
 
@@ -95,6 +97,7 @@ class SolveStmt:
 @dataclass(frozen=True)
 class OutputStmt:
     fields:   Tuple[str, ...] = ()
+    flag_fields: Tuple[str, ...] = ()    # Atlas 风格裸标志，如 output con.band val.band
     run_name: Optional[str] = None
     file:     Optional[str] = None
     format:   Optional[str] = None       # npy / ssf
@@ -105,6 +108,31 @@ class OutputStmt:
 class LogStmt:
     path: str = ""
     line: int = 0
+
+
+@dataclass(frozen=True)
+class SaveStmt:
+    """Atlas ``save``：把结构/解落盘。内核不直接写，由 dataio 负责。"""
+
+    path: str = ""
+    line: int = 0
+
+
+@dataclass(frozen=True)
+class ExtractStmt:
+    """Atlas ``extract``：提取曲线特征量。当前只解析并提示。"""
+
+    raw:  str = ""
+    line: int = 0
+
+
+@dataclass(frozen=True)
+class WorkflowStmt:
+    """流程控制类语句（go/quit/plot/tonyplot/comment），纯兼容、无副作用。"""
+
+    keyword: str = ""
+    raw:     str = ""
+    line:    int = 0
 
 
 @dataclass(frozen=True)
