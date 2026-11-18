@@ -39,7 +39,15 @@ jobs:
           for f in python/tests/test_*.py; do
             [ "$f" = "python/tests/test_gui.py" ] && continue
             echo "== $f"
-            python "$f"
+            if ! python "$f" > test.log 2>&1; then
+              # 失败时把 FAIL / Traceback 行变成注解，便于通过 API 定位
+              grep -E "FAIL|Traceback|Error" test.log | head -n 20 | while IFS= read -r line; do
+                echo "::error::${f}: ${line//%/%25}"
+              done
+              tail -n 40 test.log
+              exit 1
+            fi
+            tail -n 2 test.log
           done
           # GUI 测试需要显示与 tkinter；runner 上缺任何一个就明确跳过
           if python -c "import tkinter" 2>/dev/null; then
