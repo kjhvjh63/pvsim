@@ -128,14 +128,20 @@ typedef struct {
 
 /* B(x) = x / (e^x - 1)，稳定求值 */
 static double bern(double x) {
+    /* Bernoulli 函数 B(x) = x/(e^x-1)。用 expm1 而不是 exp(x)-1：
+     * |x| 略大于 1e-8 时 exp(x)-1 的绝对误差是 ~eps*e^x ≈ 1e-16，
+     * 相对误差就是 1e-16/|x| ≈ 1e-8；而 SG 通量是两个 n·B(±Δ) 大项
+     * 相消，这个 1e-8 直接成为 div J 的相对误差地板（低光时它比
+     * |J|/hc 还大，0.1 mW 的 1e-9 精度要求正被它卡住）。
+     * expm1 内部做补偿求和，相对误差回到 eps。数学上与原式完全相同。 */
     if (x > 1e-8) {
         if (x > 700.0) return 0.0;
-        return x / (exp(x) - 1.0);
+        return x / expm1(x);
     }
     if (x < -1e-8) {
         double y = -x;
         if (y > 700.0) return y;
-        return y / (1.0 - exp(-y));
+        return y / (-expm1(-y));
     }
     return 1.0 - 0.5 * x + x * x / 12.0;
 }
@@ -2054,6 +2060,9 @@ static void store_guess(pvk_ctx* ctx, const pvk_model* m, const double* u) {
     }
 }
 
+/* 冷启动重试的递归深度（只为防无限递归；正常最多 1 层）。 */
+static int g_retry_depth = 0;
+
 PVK_API int pvk_solve_dc(pvk_ctx* ctx,
                          const pvk_device* dev,
                          const pvk_optics_in* opt,
@@ -2361,19 +2370,46 @@ PVK_API int pvk_solve_dc(pvk_ctx* ctx,
     info.v_applied = V_app;
     if (!done) info.converged = 0;
 
+    /* 延续失败：目标点改为冷启动重解一次。高偏压（>Voc）时热启动解可能
+     * 落在另一条解支上，步长减半救不回来；而冷启动沿 V=0.15→… 的种子
+     * 路径能解到同一个物理解（800 nm 卡 1.30 V：热启动 line search 失败
+     * rn~1e12，冷启动 J=+22.8 mA/cm² 与旧版一致）。 */
+    int from_retry = 0;
+    if (!info.converged && ctx->have_solution && g_retry_depth == 0) {
+        g_retry_depth++;
+        ctx->have_solution = 0;
+        pvk_solve_info r2;
+        memset(&r2, 0, sizeof(r2));
+        r2.n = n;
+        if (pvk_solve_dc(ctx, dev, opt, bias, &r2) == PVK_OK && r2.converged) {
+            info = r2;
+            info.v_applied = V_app;
+            from_retry = 1;
+            done = 1;
+        }
+        if (getenv("PVK_DEBUG"))
+            fprintf(stderr, "[pvk] cold retry V=%.3f -> conv=%d it=%d r=%.2e\n",
+                    V_app, r2.converged, r2.iterations, r2.residual);
+        g_retry_depth--;
+    }
+
     double J = 0.0;
-    if (info.converged) {
+    if (info.converged && from_retry) {
+        J = ctx->last_J;          /* 内层已写好 fields 与 last_J */
+    } else if (info.converged) {
         fill_fields(ctx, &m, u, &J);
         /* 分支跳变防护：隐式接触层让方程有多条解支（例如吸收层被整层
          * 钉扎、电流几乎为零的"死"解）。继续法从正确解支出发时，若某一步
          * Newton 跑到另一条支上，终端电流会在 0.02 V 内反向并跳变几个
          * Jsc —— Cs2AgBiBr6 复刻卡 1.28→1.30 V 就从 -16 跳到 +22 mA/cm²
          * 并被宽松判据当成收敛。正常 J-V 在 Voc 附近也会反号，但 |ΔJ|
-         * 只有几 mA，所以阈值保守地取 10 mA/cm²，只拦大幅跳变。 */
+         * 只有几 mA，所以阈值保守地取 10 mA/cm²。但 Voc 附近是指数段，
+         * 20 mV 内 |J| 就能涨好几倍（1.28→1.30 实测 -3.06→+22.8），
+         * 所以只有 |J| 缩到前一点的 20% 以下（死解特征）才判为跳支。 */
         int branch_jump = had_prev && fabs(V_app - V_prev0) < 0.1 &&
                           isfinite(J_prev) && fabs(J_prev) > 1.0 &&
                           J * J_prev < 0.0 &&
-                          fabs(J) > 0.5 * fabs(J_prev) &&
+                          fabs(J) < 0.2 * fabs(J_prev) &&
                           fabs(J - J_prev) > 10.0;   /* mA/cm²：只拦大幅跳变 */
         if (!isfinite(J) || fabs(J) > 1e5 || branch_jump) {
             /* 解出来的电流不物理（发散状态但残差判据被绕过），按失败处理 */
