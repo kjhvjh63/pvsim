@@ -36,6 +36,7 @@ class Layer(ct.Structure):
         ("Na_cm3",         CDouble),
         ("is_contact",     CInt),
         ("is_gen",         CInt),
+        ("b_rad_cm3_s",    CDouble),   # 辐射复合系数 B（cm^3/s），0=关闭
     ]
 
     def __repr__(self):
@@ -166,6 +167,7 @@ def layer_from_spec(spec: "LayerSpec") -> Layer:  # type: ignore[name-defined]
         Na_cm3=spec.Na_cm3,
         is_contact=1 if spec.is_contact else 0,
         is_gen=1 if spec.is_gen else 0,
+        b_rad_cm3_s=float(getattr(spec, "b_rad_cm3_s", 0.0) or 0.0),
     )
 
 

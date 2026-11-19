@@ -56,6 +56,7 @@ _PARAM_KEYS: Dict[str, str] = {
     "nc": "Nc_cm3", "nv": "Nv_cm3",
     "taun": "taun_s", "taup": "taup_s",
     "nd": "Nd_cm3", "na": "Na_cm3",
+    "copt": "b_rad_cm3_s",
 }
 
 ValueMap = Dict[str, Any]     # key → Token | List[Token]

@@ -63,8 +63,8 @@ FIELD_ALIASES: Dict[str, str] = {
     "CONC": "N",
 }
 
-# 内核当前只实现了 SRH；其余 Atlas 模型名只提示、不改变物理
-_SUPPORTED_MODELS = frozenset({"srh"})
+# 内核实现了 SRH 与辐射复合（optr → 材料 copt）；其余 Atlas 模型名只提示
+_SUPPORTED_MODELS = frozenset({"srh", "optr"})
 
 # 内建材料参数（过渡用；数值与 schema.mapbi3_stack 一致）
 BUILTIN_MATERIALS: Dict[str, Dict[str, float]] = {
@@ -150,7 +150,7 @@ class DeckCompiler:
 
     # ----- 模型 ---------------------------------------------------------
     def _check_models(self, deck: ast.Deck) -> None:
-        """内核固定在体区解 SRH；其余 Atlas 模型名只提示不生效。"""
+        """内核解 SRH + 辐射复合（optr）；其余 Atlas 模型名只提示不生效。"""
         stmt = deck.last(ast.ModelStmt)
         if stmt is None:
             return

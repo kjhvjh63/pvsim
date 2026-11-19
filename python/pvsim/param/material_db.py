@@ -42,6 +42,7 @@ _FIELD_KEYS: Dict[str, str] = {
     "nv300": "Nv_cm3", "nv": "Nv_cm3",
     "taun0": "taun_s", "taun": "taun_s",
     "taup0": "taup_s", "taup": "taup_s",
+    "copt": "b_rad_cm3_s",
 }
 
 # 同义键的优先级：先 300 K 值，再通用值
@@ -55,6 +56,7 @@ _PREFERENCE: Dict[str, Tuple[str, ...]] = {
     "taup_s":  ("taup0", "taup"),
     "mun_cm2Vs": ("mun",),
     "mup_cm2Vs": ("mup",),
+    "b_rad_cm3_s": ("copt",),
 }
 
 _NAME_KEYS = ("name", "material")

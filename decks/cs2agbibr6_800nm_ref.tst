@@ -18,23 +18,31 @@
 #   * 去 TRAP（1e14 @0.8 eV）：Voc 仅 +0.5 mV、FF +0.002 → 与寿命模型等价，
 #     本平台不必实现显式陷阱；
 #   * 去 copt=2.3e-9：Jsc 30.56 / Voc 1.2340 / FF 0.879 → 该项影响 Voc 52 mV、
-#     FF 0.069。copt 只见于 Silvaco 激光示例，疑为模板残留。
+#     FF 0.069。copt 是 Silvaco 的辐射复合系数（optr 模型，R=B(np-ni^2)，
+#     2.3e-9 cm^3/s 是直接带隙材料的典型值）；原始 3D 卡第 128-129 行确实
+#     启用了 optr。本平台已实现该物理项：内核 pvk_layer.b_rad_cm3_s /
+#     deck 关键字 copt（0=关闭，旧卡逐位不变）。
 #
-# 电学侧残差（已定位、未闭合）：
-#   * 与本机 Atlas 2D（去 copt 作基准）相比 Voc +45 mV、FF +0.02。吸收层掺杂
-#     取 4e14 与 4e16 两档时差值恒为 43~46 mV → 是固定前置因子（J0 差约
-#     2.4 倍），不是耗尽区几何差异；电极掺杂已饱和（Au 1e20 与 1e21 同值）。
-#   * 低光/暗态收敛是已知限制：0.1 mW/cm² 及以下 0/101。残差地板来自中性区
-#     p=4e16 的 SG 通量 double 舍入（~1e15 cm-3 s-1，缩放后 1e3~1e4）。
-#     试过抬高 smax（1 mW 的 Jsc 错 1.9 倍）与步长判据（0.1 mW 停在错解），
-#     两者都回退；要修需从方程尺度化（Slotboom/密度归一）入手。
+# 电学侧残差：
+#   * 补上辐射复合后 Voc 1.1805（Atlas 1.1822，差 -1.7 mV）、FF 0.8095
+#     （0.810）。此前无 copt 时的 +45 mV 基线偏高，主要就是缺 B·n·p：
+#     Voc 附近 np 大，辐射项把载流子密度压回来。
+#   * 低光收敛（已解决）：根因是 B(x)=x/(e^x-1) 用 exp(x)-1 求值，|x| 略大于
+#     1e-8 时有 1e-8 的相对误差，而 SG 通量是 n·B(±Δ) 大项相消，这个误差
+#     直接成了 div J 的精度地板。改用 expm1 后 1 sun–0.01 mW 五档均
+#     0–1.2 V 全部收敛、Jsc 严格线性（见 benchmark 第 10 项）。
 #
 # 已知差异（对照时需记住）：
+#   * 光学口径：本卡 q∫G=28.36 mA/cm²，Atlas 去 copt 的 Jsc=30.56（-7.2%）。
+#     两侧反射/光谱归一化的既有偏差，与 copt 无关，导致 Jsc 仍低 ~9.6%；
+#     Voc/FF 的电学项已对齐。
 #   * Atlas 用 index.file 的 n,k 做光学（含亚带隙吸收，无带隙截断）；
 #     本平台同样走 nk，且此处显式关掉 bandgap.mask 以对齐 Atlas 口径；
 #   * Atlas 另有 auger(1e-32) 与两个界面陷阱，实测贡献 ≈0；
 #   * Atlas 的 gold 是 conductor；本平台按 .mat 的 AU 处理。
-# 当前结果：Jsc 28.18 / Voc 1.2801 / FF 0.899（Jsc +3.3%、Voc +98 mV、FF +0.089）。
+#   * 强注入区（>1.36 V）Newton 仍会停滞；JV 指标只用 Voc 以下的数据。
+# 当前结果：Jsc 24.65 / Voc 1.1805 / FF 0.8095（对照 Atlas：Jsc -9.6%、
+# Voc -1.7 mV、FF -0.0005）。
 
 title Cs2AgBiBr6 800nm reference cell (Silvaco replica)
 
@@ -62,12 +70,12 @@ material name=TIO2 eg=3.2 chi=4 eps=100 nc=2e20 nv=1e21 \
          mun=6e-3 mup=6e-3 taun=1e-6 taup=1e-5
 
 material name=CS2AGBIBR6 eg=1.61 chi=3.72 eps=5.8 nc=2e18 nv=1e19 \
-         mun=9.28 mup=9.28 taun=6.6e-7 taup=6.6e-7
+         mun=9.28 mup=9.28 taun=6.6e-7 taup=6.6e-7 copt=2.3e-9
 
 material name=NIO eg=3.8 chi=1.46 eps=10.7 nc=2.8e19 nv=1e19 \
          mun=12 mup=2.8 taun=1e-6 taup=1e-5
 
-models srh
+models srh optr
 optics spectrum=am15g intensity=100 bounces=1 bandgap.mask=0 \
        nk.dir="D:/交互界面_data/datasets/nk"
 

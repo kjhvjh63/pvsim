@@ -91,6 +91,7 @@ typedef struct {
     double* mup;
     double* taun;
     double* taup;
+    double* brad;       /* 辐射复合系数 B，cm³/s（0=关闭；R_rad=B(np-ni²)） */
     double* Nd;
     double* Na;
     double* G;          /* cm⁻³ s⁻¹ */
@@ -215,16 +216,19 @@ static double residual(const pvk_model* m, const double* u, double* r,
         if (!isfinite(pbuf[i])) pbuf[i] = 1e300;
     }
 
-    /* SRH 净复合 R（正=复合） */
+    /* SRH 净复合 R（正=复合），叠加辐射复合 B(np-ni²)（B=0 时逐位不变） */
     for (int i = 0; i < n; i++) {
         double ni = m->ni[i];
         double np = nbuf[i] * pbuf[i];
         if (!isfinite(np)) np = 1e300;
+        double dnp = np - ni * ni;
+        double rad = m->brad[i] * dnp;
+        if (!isfinite(rad)) rad = 0.0;
         double den = m->taup[i] * (nbuf[i] + ni) + m->taun[i] * (pbuf[i] + ni);
         if (den > 0.0 && isfinite(den)) {
-            rnet[i] = (np - ni * ni) / den;
+            rnet[i] = dnp / den + rad;
         } else {
-            rnet[i] = 0.0;
+            rnet[i] = rad;
         }
         if (!isfinite(rnet[i])) rnet[i] = 0.0;
     }
@@ -774,7 +778,7 @@ static void model_free(pvk_model* m) {
     pvk__free(m->eps);  pvk__free(m->chi); pvk__free(m->Eg);
     pvk__free(m->Nc);   pvk__free(m->Nv);
     pvk__free(m->mun);  pvk__free(m->mup);
-    pvk__free(m->taun); pvk__free(m->taup);
+    pvk__free(m->taun); pvk__free(m->taup); pvk__free(m->brad);
     pvk__free(m->Nd);   pvk__free(m->Na);
     pvk__free(m->G);    pvk__free(m->ni);
     pvk__free(m->chis); pvk__free(m->egs);
@@ -898,6 +902,7 @@ static int model_init(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
     m->mup  = (double*)pvk__malloc(dn);
     m->taun = (double*)pvk__malloc(dn);
     m->taup = (double*)pvk__malloc(dn);
+    m->brad = (double*)pvk__malloc(dn);
     m->Nd   = (double*)pvk__malloc(dn);
     m->Na   = (double*)pvk__malloc(dn);
     m->G    = (double*)pvk__malloc(dn);
@@ -909,7 +914,7 @@ static int model_init(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
     m->cpl  = (unsigned char*)pvk__malloc(sizeof(unsigned char) * (size_t)n);
     m->cpl_maj = (unsigned char*)pvk__malloc(sizeof(unsigned char) * (size_t)n);
     if (!m->eps || !m->chi || !m->Eg || !m->Nc || !m->Nv || !m->mun ||
-        !m->mup || !m->taun || !m->taup || !m->Nd || !m->Na || !m->G ||
+        !m->mup || !m->taun || !m->taup || !m->brad || !m->Nd || !m->Na || !m->G ||
         !m->ni || !m->chis || !m->egs || !m->hc || !m->bc || !m->cpl ||
         !m->cpl_maj) {
         model_free(m);
@@ -938,6 +943,7 @@ static int model_init(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
         m->mup[i]  = L->mup_cm2Vs > 0 ? L->mup_cm2Vs : 1e-6;
         m->taun[i] = L->taun_s > 0 ? L->taun_s : 1e-12;
         m->taup[i] = L->taup_s > 0 ? L->taup_s : 1e-12;
+        m->brad[i] = L->b_rad_cm3_s > 0 ? L->b_rad_cm3_s : 0.0;
         m->Nd[i]   = homo * L->Nd_cm3;
         m->Na[i]   = homo * L->Na_cm3;
         m->ni[i]   = sqrt(m->Nc[i] * m->Nv[i]) * exp(-eg_i / (2.0 * Vt));
@@ -1138,8 +1144,11 @@ static int solve_newton(pvk_model* m, double* u,
             double ni = m->ni[i];
             double np = nbuf[i] * pbuf[i];
             if (!isfinite(np)) np = 1e300;
+            double dnp = np - ni * ni;
+            double rad = m->brad[i] * dnp;
+            if (!isfinite(rad)) rad = 0.0;
             double den = m->taup[i] * (nbuf[i] + ni) + m->taun[i] * (pbuf[i] + ni);
-            rnet[i] = (den > 0.0 && isfinite(den)) ? (np - ni * ni) / den : 0.0;
+            rnet[i] = (den > 0.0 && isfinite(den) ? dnp / den : 0.0) + rad;
             if (!isfinite(rnet[i])) rnet[i] = 0.0;
         }
 
@@ -1159,9 +1168,12 @@ static int solve_newton(pvk_model* m, double* u,
                     double ni = m->ni[jn];
                     double np = nbuf[jn] * pbuf[jn];
                     if (!isfinite(np)) np = 1e300;
+                    double dnp = np - ni * ni;
+                    double rad = m->brad[jn] * dnp;
+                    if (!isfinite(rad)) rad = 0.0;
                     double den = m->taup[jn] * (nbuf[jn] + ni)
                                + m->taun[jn] * (pbuf[jn] + ni);
-                    rnet[jn] = (den > 0.0 && isfinite(den)) ? (np - ni * ni) / den : 0.0;
+                    rnet[jn] = (den > 0.0 && isfinite(den) ? dnp / den : 0.0) + rad;
                     if (!isfinite(rnet[jn])) rnet[jn] = 0.0;
                 }
 
@@ -1848,7 +1860,9 @@ static void initial_guess(pvk_ctx* ctx, const pvk_device* dev, pvk_model* m,
         double np0 = n0 * p0;
         if (!(np0 > 0.0) || !isfinite(np0)) continue;
         double tau = 1.0 / (1.0 / m->taun[i] + 1.0 / m->taup[i]);
-        double np_t = ni * ni + m->G[i] * tau;
+        /* 辐射复合与 SRH 并联：np-ni² = G·τ/(1+B·τ)。漏掉 B·τ 会把初值
+         * 的目标 np 抬得过高（劈裂偏大），亮态首步残差反而变大。 */
+        double np_t = ni * ni + m->G[i] * tau / (1.0 + m->brad[i] * tau);
         double split = Vt * log(np_t / np0);
         if (!(split > 0.0) || !isfinite(split)) continue;
         if (split > 1.2) split = 1.2;   /* 上限 ≈ 1.2 eV，避免初值过冲 */
@@ -1922,8 +1936,9 @@ static void fill_fields(pvk_ctx* ctx, pvk_model* m, const double* u,
         if (rnet) {
             double ni = m->ni[i];
             double np = nbuf[i] * pbuf[i];
+            double dnp = np - ni * ni;
             double den = m->taup[i] * (nbuf[i] + ni) + m->taun[i] * (pbuf[i] + ni);
-            rnet[i] = (den > 0 ? (np - ni * ni) / den : 0.0) - m->G[i];
+            rnet[i] = (den > 0 ? dnp / den : 0.0) + m->brad[i] * dnp - m->G[i];
         }
     }
 

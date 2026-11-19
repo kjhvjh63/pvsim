@@ -64,6 +64,7 @@ typedef struct {
     double Na_cm3;
     int    is_contact;             /* bool-ish, 0/1 */
     int    is_gen;                 /* bool-ish, 0/1 */
+    double b_rad_cm3_s;            /* 辐射复合系数 B：R_rad = B*(n*p - ni^2)，0=关闭 */
 } pvk_layer;
 
 /* ------------------------------------------------------------ */

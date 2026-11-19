@@ -205,6 +205,7 @@ class LayerSpec:
     is_contact:              bool      = False # 是否是电极层（边界条件挂载点）
     is_gen:                  bool      = True  # 是否参与光吸收计算
     defects:                 Tuple[DefectSpec, ...] = ()  # bulk SRH 陷阱（可空）
+    b_rad_cm3_s:             float     = 0.0   # 辐射复合系数 B（cm^3/s），0=关闭
 
     def __post_init__(self):
         # 接受 list / 任意 Iterable → tuple，保证 frozen 语义与可哈希
@@ -260,6 +261,8 @@ class LayerSpec:
             notes.append(f"{prefix}: SRH tau must be >= 0")
         if self.Nd_cm3 < 0 or self.Na_cm3 < 0:
             notes.append(f"{prefix}: doping must be >= 0")
+        if self.b_rad_cm3_s < 0:
+            notes.append(f"{prefix}: b_rad_cm3_s={self.b_rad_cm3_s} must be >= 0")
         for j, d in enumerate(self.defects):
             notes.extend(d.validate(j, Eg_eV=self.Eg_eV))
         return notes
