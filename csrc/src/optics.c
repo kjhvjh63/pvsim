@@ -19,6 +19,8 @@
  *   ``<material>_nk_wavelength.txt`` / ``<material>_nk.txt``，文件格式为
  *   「首行点数，随后 λ(µm) n k」三列（两列时 k=0）。命中后
  *   α(λ) = 4πk/λ，并做非相干多次往返：
+ *     - 折射率：表内插值；λ 超出数据范围时钳制到最近端点（与 Atlas 实测
+ *       的平滑外推一致），只有整张表缺失时才退回 sqrt(εr)；
  *     - 入射：空气→首层，乘菲涅尔透射 (1-R_front)；
  *     - 层间：每过一层界面乘 (1-R)，用两侧实折射率；
  *     - 背电极：正向程结束乘金属反射率 R_back（末层有 nk 时按复折射率
@@ -165,6 +167,20 @@ static double fresnel_r(double n1, double n2) {
     return r * r;
 }
 
+/* 取折射率 n：表内线性插值；超出数据范围时钳制到最近端点。
+ * 实测 Atlas 在 FTO 的 nk 截止（0.898 µm）处没有台阶：单色扫描
+ * 0.89→0.90 µm 的吸收率比值 0.953，与端点钳制的 0.952 一致；而旧的
+ * √εr 回退（n=3.0）会在 898 nm 突然把前表面反射从 7.8% 抬到 25%
+ * （比值 0.766），纯属数值伪影。 */
+static int nk_lookup_n_clamped(const pvk_nk* t, double lam_nm, double* n_out) {
+    if (!t || t->count < 1 || !n_out) return 0;
+    double lu = lam_nm * 1e-3;                 /* nm → µm */
+    if (lu < t->lam_um[0]) lu = t->lam_um[0];
+    if (lu > t->lam_um[t->count - 1]) lu = t->lam_um[t->count - 1];
+    if (t->count == 1) { *n_out = t->n[0]; return 1; }
+    return nk_lookup(t, lu * 1e3, n_out, NULL);
+}
+
 /* 带隙唯象模型（无 nk 数据时的兜底）。 */
 static double alpha_phenom(const pvk_device* dev, int li, double E_eV) {
     if (li < 0 || li >= dev->n_layers) return 0.0;
@@ -287,8 +303,8 @@ PVK_API int pvk_optics_compute(pvk_ctx* ctx,
             for (int i = 0; i < n_node; i++) {
                 int li = ctx->mesh.node_layer[i];
                 double nn;
-                if (!nk_lookup((li >= 0 && li < dev->n_layers) ? &nks[li] : NULL,
-                               lam, &nn, NULL)) {
+                if (!nk_lookup_n_clamped((li >= 0 && li < dev->n_layers)
+                                         ? &nks[li] : NULL, lam, &nn)) {
                     double eps = (li >= 0 && li < dev->n_layers)
                                  ? dev->layers[li].eps_r : 1.0;
                     nn = (eps > 1.0) ? sqrt(eps) : 1.0;

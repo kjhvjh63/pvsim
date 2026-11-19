@@ -19,9 +19,9 @@
      Jsc 塌到暗电流量级却被报成收敛。现要求 @101 与 @201 的 Jsc
      相差 <20%，且 1500nm 的 Jsc 不低于 500nm 的 70%。
   9. Atlas 2D 对齐锚点：Cs2AgBiBr6 800nm 复刻卡与 Silvaco Atlas 的
-     Jsc/Voc/FF 偏差（5% / 100 mV / 0.10）。辐射复合（copt=2.3e-9）
-     与背电极反射（复折射率 / 金属 0.95）均已在内核实现，q∫G=30.59
-     对齐 Atlas 去 copt 的基线 30.56。
+     Jsc/Voc/FF 偏差（5% / 100 mV / 0.10）。辐射复合（copt=2.3e-9）、
+     背电极反射（复折射率 / 金属 0.95）与 nk 超范围端点钳制均已在内核
+     实现；q∫G=31.44，实测 Jsc 26.78（Atlas 27.27，-1.8%）。
  10. 低光锚点：同一复刻卡 1 sun → 0.01 mW 的 Jsc 严格线性（±2%）、
      Voc 有限且单调、Voc 以下（V≤1.2 V）各档全部收敛。锁住连续方程
      尺度化重构与精确 Bernoulli（expm1）求值的成果。复刻卡扫到 2.0 V，
@@ -163,11 +163,10 @@ def main() -> int:
     print("9. Atlas 2D 对齐锚点（Cs2AgBiBr6 800nm 复刻卡）")
     # 参考值来自本机 Silvaco Atlas（decks/atlas2d_800nm.in，1 sun）：
     # Jsc 27.27 / Voc 1.1822 / FF 0.810。复跑方式见 scripts/atlas_reference.py。
-    # 内核已实现辐射复合（copt=2.3e-9，R=B(np-ni²)）：Voc 1.1816（Atlas
-    # 1.1822）、FF 0.8067（0.810）。光学侧修正了背电极反射（旧实现把
-    # 背反射率 0.5 也错用到前表面，且未按复折射率算金属界面），
-    # q∫G 从 28.36 提到 30.59，与 Atlas 去 copt 的基线 Jsc=30.56 一致；
-    # 因此 Jsc 容差恢复 5%（实测 -4.1%，余差来自本平台略大的复合损失）。
+    # 内核已实现辐射复合（copt）与两处光学修正：背电极反射（复折射率 /
+    # 金属 0.95）、nk 超范围端点钳制（单色 Atlas 实验判定，898 nm 无台阶）。
+    # 当前 q∫G=31.44，B=0 的 Jsc=31.20 vs Atlas 30.56（+0.64）；
+    # 辐射损失 4.42 vs 3.29（+1.13），净 Jsc 26.78，差 -1.8%。
     ref_deck = (Path(__file__).resolve().parents[2] / "decks" /
                 "cs2agbibr6_800nm_ref.tst")
     ref_spec = DeckCompiler().compile_text(ref_deck.read_text(encoding="utf-8"))
