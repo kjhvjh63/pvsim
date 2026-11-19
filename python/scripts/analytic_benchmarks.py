@@ -21,7 +21,8 @@
   9. Atlas 2D 对齐锚点：Cs2AgBiBr6 800nm 复刻卡与 Silvaco Atlas 的
      Jsc/Voc/FF 偏差（5% / 100 mV / 0.10）。辐射复合（copt=2.3e-9）、
      相干薄膜光学（TMM，optics 的 coherent 开关）、背电极反射与 nk 超范围
-     端点钳制均已在内核实现；q∫G=31.56，实测 Jsc 27.11（Atlas 27.27，-0.6%）。
+     端点钳制均已在内核实现；q∫G=31.39（含 100 nm Au 的复折射率），
+     实测 Jsc 26.98（Atlas 27.27，-1.09%）。
  10. 低光锚点：同一复刻卡 1 sun → 0.01 mW 的 Jsc 严格线性（±2%）、
      Voc 有限且单调、Voc 以下（V≤1.2 V）各档全部收敛。锁住连续方程
      尺度化重构与精确 Bernoulli（expm1）求值的成果。复刻卡扫到 2.0 V，
@@ -165,7 +166,8 @@ def main() -> int:
     # Jsc 27.27 / Voc 1.1822 / FF 0.810。复跑方式见 scripts/atlas_reference.py。
     # 内核已实现辐射复合（copt）与相干薄膜光学（复折射率 TMM、完美背镜，
     # 缺 nk 的尾部接触层不传播），nk 超范围端点钳制用于消除 898 nm 假台阶。
-    # 当前 q∫G=31.56，Jsc 27.11（Atlas 27.27，-0.6%）、Voc 1.1823、FF 0.8092。
+    # 当前 q∫G=31.39（相干 + 100 nm Au），Jsc 26.98（Atlas 27.27，-1.09%）、
+    # Voc 1.1822、FF 0.8092。缺 Au nk 时回退完美背镜：q∫G 31.56、Jsc 27.11。
     ref_deck = (Path(__file__).resolve().parents[2] / "decks" /
                 "cs2agbibr6_800nm_ref.tst")
     ref_spec = DeckCompiler().compile_text(ref_deck.read_text(encoding="utf-8"))

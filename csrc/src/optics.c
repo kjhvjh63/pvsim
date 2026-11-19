@@ -534,7 +534,12 @@ PVK_API int pvk_optics_compute(pvk_ctx* ctx,
                         const pvk_layer* L = &dev->layers[li];
                         int masked = opt->bandgap_mask && L->is_gen && !L->is_contact
                                      && L->Eg_eV > 0.0 && E <= L->Eg_eV;
-                        if (!masked) a = 4.0 * PI * kk / (lam * 1e-7);
+                        /* 尾部接触层（is_contact 且非首层，如 Au）：Atlas 的光线表
+                         * 到 NiO 入口为止，金属区的吸收不计入 A_all，故该层 α=0。 */
+                        int metal = L->is_contact && li > 0;
+                        if (!masked && !metal) {
+                            a = 4.0 * PI * kk / (lam * 1e-7);
+                        }
                     }
                 }
                 alpha[i] = a;
