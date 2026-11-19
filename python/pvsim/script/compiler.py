@@ -326,6 +326,8 @@ class DeckCompiler:
             changes["nk_dir"] = stmt.nk_dir
         if stmt.coherent is not None:
             changes["coherent"] = bool(stmt.coherent)
+        if stmt.atlas_ray is not None:
+            changes["atlas_ray"] = bool(stmt.atlas_ray)
         return replace(base, **changes)
 
     # ----- 求解器 + 扫描 ------------------------------------------------

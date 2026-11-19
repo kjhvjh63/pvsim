@@ -39,6 +39,11 @@
  *     - 只有 is_gen && !is_contact 的层得到产生率；bandgap.mask 打开时
  *       E ≤ Eg 的层同样不产生载流子（这部分吸收按热损耗处理）。
  *   默认关闭，非相干路径逐位不变。
+ *
+ * 对照模式（opt->atlas_ray != 0，仅复现 Atlas，不是物理模型）：
+ *   单程 Beer-Lambert，不扣前表面/界面菲涅尔、不做背反射，
+ *   A(λ)=1-exp(-Σαd)、G=φ·α·exp(-τ)，用于逐点核对 Atlas 光线表的 A(λ)。
+ *   同时置位 coherent 时本模式优先。
  */
 
 #include "pvk_internal.h"
@@ -511,6 +516,47 @@ PVK_API int pvk_optics_compute(pvk_ctx* ctx,
         if (!(phi > 0.0) || !isfinite(phi)) continue;
 
         double E = PVK_HC_EVNM / lam;             /* eV */
+
+        /* --- 仅复现 Atlas 的“单程、无界面反射”对照路径 ---
+         * Atlas 的 BEAM 是非相干光线追踪：不扣前表面/界面菲涅尔，也不做
+         * 背反射。这里按 A(λ)=1-exp(-Σαd)、G=φ·α·exp(-τ) 逐节点累积，
+         * 吸收率含所有有 nk 的层（含 FTO 接触层，Atlas 的 A_all 同样算它），
+         * 产生率仍只给 is_gen && !is_contact 的层。仅用于逐点核对
+         * Atlas 光线表的 A(λ)，不是物理模型；默认关闭。 */
+        if (opt->atlas_ray != 0 && nks && nk_layers > 0) {
+            const double PI = 3.14159265358979323846;
+            for (int i = 0; i < n_node; i++) {
+                int li = ctx->mesh.node_layer[i];
+                double a = 0.0;
+                if (li >= 0 && li < dev->n_layers) {
+                    double nn = 0.0, kk = 0.0;
+                    if (nk_lookup_clamped(&nks[li], lam, &nn, &kk) && kk > 0.0) {
+                        const pvk_layer* L = &dev->layers[li];
+                        int masked = opt->bandgap_mask && L->is_gen && !L->is_contact
+                                     && L->Eg_eV > 0.0 && E <= L->Eg_eV;
+                        if (!masked) a = 4.0 * PI * kk / (lam * 1e-7);
+                    }
+                }
+                alpha[i] = a;
+            }
+            tau[0] = 0.0;
+            for (int i = 1; i < n_node; i++) {
+                tau[i] = tau[i - 1]
+                       + 0.5 * (alpha[i - 1] + alpha[i]) * ctx->mesh.dx[i - 1];
+            }
+            for (int i = 0; i < n_node; i++) {
+                if (alpha[i] <= 0.0) continue;
+                int li = ctx->mesh.node_layer[i];
+                if (li < 0 || li >= dev->n_layers) continue;
+                const pvk_layer* L = &dev->layers[li];
+                if (!L->is_gen || L->is_contact) continue;
+                g_field[i] += phi * alpha[i] * exp(-tau[i]);
+            }
+            if (out_absorb_spectrum) {
+                out_absorb_spectrum[w] = 1.0 - exp(-tau[n_node - 1]);
+            }
+            continue;
+        }
 
         if (coherent) {
             double A = coherent_one(ctx, dev, nks, n_opt, back_mirror, xoff,

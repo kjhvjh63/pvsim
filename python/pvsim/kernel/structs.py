@@ -66,6 +66,7 @@ class OpticsIn(ct.Structure):
         ("bandgap_mask",       CInt),
         ("nk_dir",             CCharP),
         ("coherent",           CInt),
+        ("atlas_ray",          CInt),
     ]
 
 
@@ -206,6 +207,7 @@ def optics_from_spec(spec: "OpticsSpec") -> OpticsIn:  # type: ignore[name-defin
         bandgap_mask=1 if spec.bandgap_mask else 0,
         nk_dir=(spec.nk_dir.encode("utf-8") if spec.nk_dir else None),
         coherent=1 if spec.coherent else 0,
+        atlas_ray=1 if spec.atlas_ray else 0,
     )
 
 

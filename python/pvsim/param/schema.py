@@ -387,6 +387,7 @@ class OpticsSpec:
     bandgap_mask:       bool        = True     # λ > 1239.84/Eg 的波长不参与
     nk_dir:             Optional[str] = None   # 逐层 n,k 数据目录；None 则用统一默认表
     coherent:           bool        = False    # True=相干薄膜光学（TMM），需 nk_dir
+    atlas_ray:          bool        = False    # 仅复现 Atlas：单程、无界面反射，需 nk_dir
 
     def __post_init__(self):
         # 确保 numpy 数组
@@ -419,8 +420,10 @@ class OpticsSpec:
             notes.append(f"OpticsSpec: intensity_mW_cm2 must be >= 0")
         if self.bounces not in (1, 100, 1000):
             notes.append(f"OpticsSpec: bounces={self.bounces} unusual; expected 1/100/1000")
-        if self.coherent and not self.nk_dir:
-            notes.append("OpticsSpec: coherent=True 需要 nk_dir，否则退回非相干模型")
+        if (self.coherent or self.atlas_ray) and not self.nk_dir:
+            notes.append("OpticsSpec: coherent/atlas_ray=True 需要 nk_dir，否则退回非相干模型")
+        if self.coherent and self.atlas_ray:
+            notes.append("OpticsSpec: coherent 与 atlas_ray 同时置位，内核优先 atlas_ray")
         # nk_dir=None 是完全合法的默认态（内核内置简化 n,k 表），不做 note
         return notes
 
@@ -433,6 +436,7 @@ class OpticsSpec:
             "bandgap_mask": self.bandgap_mask,
             "nk_dir": self.nk_dir,
             "coherent": self.coherent,
+            "atlas_ray": self.atlas_ray,
         }
 
     @classmethod
@@ -445,6 +449,7 @@ class OpticsSpec:
             bandgap_mask=bool(d.get("bandgap_mask", True)),
             nk_dir=d.get("nk_dir"),
             coherent=bool(d.get("coherent", False)),
+            atlas_ray=bool(d.get("atlas_ray", False)),
         )
 
     @classmethod

@@ -74,6 +74,7 @@ class OpticsStmt:
     spectrum:     Optional[str] = None
     nk_dir:       Optional[str] = None
     coherent:     Optional[bool] = None
+    atlas_ray:    Optional[bool] = None
     line:         int = 0
 
 

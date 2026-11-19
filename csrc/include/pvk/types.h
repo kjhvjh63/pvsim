@@ -88,6 +88,7 @@ typedef struct {
     int    bandgap_mask;           /* 0/1 */
     const char* nk_dir;            /* NULL = 内核用默认 n,k */
     int    coherent;               /* 1 = 相干薄膜光学（TMM）；0 = 非相干多次往返 */
+    int    atlas_ray;              /* 1 = 仅复现 Atlas：单程 Beer-Lambert，无界面反射 */
 } pvk_optics_in;
 
 /* ------------------------------------------------------------ */

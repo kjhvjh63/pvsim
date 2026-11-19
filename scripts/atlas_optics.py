@@ -117,15 +117,16 @@ def platform_curves(deck: Path):
     x = np.asarray(lib.get_x(ctx, n)) * 1e7
 
     out = {}
-    for coherent in (True, False):
-        spec = replace(base.optics, coherent=coherent)
+    for tag, kw in (("coh", dict(coherent=True, atlas_ray=False)),
+                    ("inc", dict(coherent=False, atlas_ray=False)),
+                    ("ray", dict(coherent=False, atlas_ray=True))):
+        spec = replace(base.optics, **kw)
         opt = st.optics_from_spec(spec)
         a = (ct.c_double * opt.n_wl)()
         g = (ct.c_double * n)()
         rc = lib._lib.pvk_optics_compute(ctx, ct.byref(dev), ct.byref(opt), a, g)
         lib._check(ctx, rc, "optics_compute")
-        out["coh" if coherent else "inc"] = (
-            spec.wl_nm.copy(), np.asarray(list(a)), x, np.asarray(list(g)))
+        out[tag] = (spec.wl_nm.copy(), np.asarray(list(a)), x, np.asarray(list(g)))
     lib.destroy(ctx)
     return base, out
 
@@ -162,13 +163,19 @@ def main() -> int:
 
         if args.compare:
             _, curves = platform_curves(PLATFORM_DECK)
-            print(f"\n{'λ(nm)':>7} {'A_all':>7} {'coh':>7} {'inc':>7}")
+            print(f"\n{'λ(nm)':>7} {'A_all':>7} {'coh':>7} {'inc':>7} {'ray':>7}")
+            rms = []
             for t in (400, 500, 600, 700, 800, 900, 1000, 1050):
                 i = int(np.argmin(abs(lam - t)))
-                wlc, ac, _, _ = curves["coh"]
-                _, ai, _, _ = curves["inc"]
-                jc = int(np.argmin(abs(wlc - t)))
-                print(f"{lam[i]:7.0f} {a_all[i]:7.4f} {ac[jc]:7.4f} {ai[jc]:7.4f}")
+                vals = {}
+                for tag in ("coh", "inc", "ray"):
+                    wlc, ac, _, _ = curves[tag]
+                    vals[tag] = float(ac[int(np.argmin(abs(wlc - t)))])
+                rms.append((vals["ray"] - a_all[i]) ** 2)
+                print(f"{lam[i]:7.0f} {a_all[i]:7.4f} {vals['coh']:7.4f} "
+                      f"{vals['inc']:7.4f} {vals['ray']:7.4f}")
+            print(f"\nRMS(ray − A_all) = {float(np.sqrt(np.mean(rms))):.4f}"
+                  "（atlas.ray 对照模式）")
             root = Path(tempfile.gettempdir())
             np.savez(root / "atlas_optics.npz", lam=lam, a_all=a_all,
                      a_pvk=a_pvk, y=y, g=g)
