@@ -65,6 +65,7 @@ class OpticsIn(ct.Structure):
         ("bounces",            CInt),
         ("bandgap_mask",       CInt),
         ("nk_dir",             CCharP),
+        ("coherent",           CInt),
     ]
 
 
@@ -204,6 +205,7 @@ def optics_from_spec(spec: "OpticsSpec") -> OpticsIn:  # type: ignore[name-defin
         bounces=int(spec.bounces),
         bandgap_mask=1 if spec.bandgap_mask else 0,
         nk_dir=(spec.nk_dir.encode("utf-8") if spec.nk_dir else None),
+        coherent=1 if spec.coherent else 0,
     )
 
 

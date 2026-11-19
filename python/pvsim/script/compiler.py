@@ -324,6 +324,8 @@ class DeckCompiler:
             changes["bandgap_mask"] = bool(stmt.bandgap_mask)
         if stmt.nk_dir is not None:
             changes["nk_dir"] = stmt.nk_dir
+        if stmt.coherent is not None:
+            changes["coherent"] = bool(stmt.coherent)
         return replace(base, **changes)
 
     # ----- 求解器 + 扫描 ------------------------------------------------

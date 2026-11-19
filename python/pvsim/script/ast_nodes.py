@@ -73,6 +73,7 @@ class OpticsStmt:
     bandgap_mask: Optional[bool] = None
     spectrum:     Optional[str] = None
     nk_dir:       Optional[str] = None
+    coherent:     Optional[bool] = None
     line:         int = 0
 
 

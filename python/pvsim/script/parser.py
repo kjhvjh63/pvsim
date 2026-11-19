@@ -17,7 +17,7 @@
     contact/electrode name=anode workfunction=4.7
     material name=MAPBI3 eg=1.6 taun=8e-9
     models srh
-    optics spectrum=am15g intensity=100 bounces=1 bandgap.mask
+    optics spectrum=am15g intensity=100 bounces=1 bandgap.mask [coherent]
     method newton maxiter=60 tol=1e-8 damping=1.0
     solve vstart=0 vfinal=1.8 vstep=0.05                    # 或 vanode=
     log file=out/jv.log
@@ -342,17 +342,21 @@ def _p_optics(values: ValueMap, flags: List[str], word: Token,
               warnings: List[str]) -> ast.OpticsStmt:
     _reject_unknown(values, flags,
                     ("spectrum", "intensity", "bounces", "bandgap.mask",
-                     "mask", "nk.dir"),
+                     "mask", "nk.dir", "coherent"),
                     word.line, warnings, "optics")
     mask = _bool(values, "bandgap.mask", "mask")
     if mask is None and ("mask" in flags or "bandgap.mask" in flags):
         mask = True
+    coherent = _bool(values, "coherent")
+    if coherent is None and "coherent" in flags:
+        coherent = True
     return ast.OpticsStmt(
         intensity=_num(values, "intensity"),
         bounces=_int(values, "bounces"),
         bandgap_mask=mask,
         spectrum=_word(values, "spectrum"),
         nk_dir=_word(values, "nk.dir"),
+        coherent=coherent,
         line=word.line,
     )
 

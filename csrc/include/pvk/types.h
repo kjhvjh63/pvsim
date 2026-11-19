@@ -87,6 +87,7 @@ typedef struct {
     int    bounces;                /* 1 / 100 / 1000 */
     int    bandgap_mask;           /* 0/1 */
     const char* nk_dir;            /* NULL = 内核用默认 n,k */
+    int    coherent;               /* 1 = 相干薄膜光学（TMM）；0 = 非相干多次往返 */
 } pvk_optics_in;
 
 /* ------------------------------------------------------------ */

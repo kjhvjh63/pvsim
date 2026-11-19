@@ -33,32 +33,35 @@
 #     0–1.2 V 全部收敛、Jsc 严格线性（见 benchmark 第 10 项）。
 #
 # 光学侧修正：
-#   * 背反射路径：旧实现把 r_back=0.5 用在每一程结束（反向程回前表面也
-#     当金属镜面），金属界面又用实折射率重复扣透射，q∫G 只有 28.36。
+#   * 背反射路径（非相干，默认）：旧实现把 r_back=0.5 用在每一程结束（反向程
+#     回前表面也当金属镜面），金属界面又用实折射率重复扣透射，q∫G 只有 28.36。
 #     改为正向乘金属反射率（末层有 nk 时按复折射率，缺 nk 时按 Au 典型
 #     0.95）、反向乘前表面菲涅尔，q∫G 提到 30.59。
 #   * nk 外推：FTO.txt 止于 0.898 µm。单色 Atlas 实验（0.86–0.92 µm）
 #     显示该处无台阶（A(0.90)/A(0.89)=0.953，端点钳制预测 0.952，而
 #     √εr 回退预测 0.766），说明 Atlas 做平滑外推。内核已改为把 n 钳制
 #     到表端点，消除 898 nm 处 25% 的假前反射，q∫G 30.59→31.44。
+#   * 相干薄膜光学（optics 的 coherent 开关）：逐层复折射率 TMM 求内部场，
+#     尾部 Au 接触层不参与传播、其界面按完美背镜 E=0；吸收密度 n·k·|E|²
+#     按网格节点沉积。默认关闭（旧卡逐位不变），本卡启用：
+#       q∫G 31.56；Jsc 27.11（Atlas 27.27，-0.6%）、Voc 1.1823（-0.1 mV）、
+#       FF 0.8092（-0.0011）、PCE 25.94%（Atlas 26.13%）。
 #
-# 剩余 Jsc 残差（-1.8%）：
-#   * 生成侧本卡略高：B=0 的 Jsc=31.20，Atlas 去 copt 为 30.56（+0.64）。
-#   * 复合侧本卡偏大：辐射损失 4.42 vs Atlas 3.29（+1.13），折合短路段
-#     准费米劈裂高约 7 mV；净差 -0.49。
+# 单色口径说明：
+#   用 Atlas beam 单波长、从 V=0 电流/qΦ 反推的 A(800)≈0.49、A(1000)≈0.16，
+#   明显低于相干 TMM 的 0.86/0.22；但同一套光学的宽带 Jsc 与 Atlas 一致
+#   （27.11 vs 27.27），说明单色反推把短路段复合混进了「吸收率」，不能
+#   直接当逐波长吸收率用。逐波长定量对照需另取 Atlas 的光学输出。
 #
 # 已知差异（对照时需记住）：
 #   * Atlas 用 index.file 的 n,k 做光学（含亚带隙吸收，无带隙截断）；
 #     本平台同样走 nk，且此处显式关掉 bandgap.mask 以对齐 Atlas 口径；
-#   * 本平台是非相干多次往返；单色实验反推 Atlas 的 A(800 nm)≈0.49，
-#     明显低于本平台的 0.78，说明 Atlas 的薄膜光学含相干干涉——宽带
-#     积分接近并不等于逐波长一致，量化对照时需注意；
 #   * Atlas 另有 auger(1e-32) 与两个界面陷阱，实测贡献 ≈0；
 #   * Atlas 的 gold 是 conductor（无 Au region）；本平台按 100 nm Au
-#     接触层处理，光学上由 r_back 的金属反射率代表；
+#     接触层处理，光学上由完美背镜（相干）或金属反射率（非相干）代表；
 #   * 强注入区（>1.36 V）Newton 仍会停滞；JV 指标只用 Voc 以下的数据。
-# 当前结果：Jsc 26.78 / Voc 1.1820 / FF 0.8066（对照 Atlas：Jsc -1.8%、
-# Voc -0.2 mV、FF -0.0037）。
+# 当前结果（coherent）：Jsc 27.11 / Voc 1.1823 / FF 0.8092 / PCE 25.94%
+#           （非相干对照：Jsc 26.78 / Voc 1.1820 / FF 0.8066 / PCE 25.54%）
 
 title Cs2AgBiBr6 800nm reference cell (Silvaco replica)
 
@@ -92,7 +95,7 @@ material name=NIO eg=3.8 chi=1.46 eps=10.7 nc=2.8e19 nv=1e19 \
          mun=12 mup=2.8 taun=1e-6 taup=1e-5
 
 models srh optr
-optics spectrum=am15g intensity=100 bounces=1 bandgap.mask=0 \
+optics spectrum=am15g intensity=100 bounces=1 bandgap.mask=0 coherent \
        nk.dir="D:/交互界面_data/datasets/nk"
 
 method newton maxiter=80 tol=1e-8 damping=1.0
