@@ -27,6 +27,9 @@
      Voc 有限且单调、Voc 以下（V≤1.2 V）各档全部收敛。锁住连续方程
      尺度化重构与精确 Bernoulli（expm1）求值的成果。复刻卡扫到 2.0 V，
      强注入区（>1.36 V）Newton 仍会停滞，属已知数值限制，不在此锚点内。
+ 11. 光学模式自检：atlas.ray 与独立 Python 单程 Beer-Lambert 复算一致
+     （A(800)/A(1000) ±2%），coherent 的 q∫G 与 A(800) 在合理区间。
+     锁住新增的相干/对照光学路径，防止单位或索引回归。
 
 --export DIR 会把 1 sun 的 J-V 写成 SSF/.log（DeckBuild 可直接打开），
 用于和 SCAPS / Silvaco 等外部结果逐点对照。
@@ -211,6 +214,86 @@ def main() -> int:
     n_tot = sum(1 for p in res9.points if p.V <= v_cut)
     check(f"V≤{v_cut:g} V 各档全部收敛", n_min == n_tot,
           f"最少 {n_min}/{n_tot}")
+
+    print("11. 光学模式自检（atlas.ray / coherent）")
+    # atlas.ray 是「单程、无界面反射」的对照路径；用独立 Python 复算同一套
+    # nk 的 Beer-Lambert 吸收，二者必须在 2% 内一致（防止单位/索引回归）。
+    import ctypes as ct
+    from pvsim.kernel.abi import PvkLib
+    from pvsim.kernel import structs as st
+
+    nk_dir = Path(ref_spec.optics.nk_dir or "")
+    if not nk_dir.exists():
+        print("  [SKIP] nk.dir 不存在，跳过光学自检")
+    else:
+        def _tab(name: str):
+            for pat in ("{}.txt", "{}_nk_wavelength.txt", "{}_nk.txt"):
+                p = nk_dir / pat.format(name)
+                if not p.exists():
+                    continue
+                rows = []
+                for ln in p.read_text(errors="ignore").splitlines():
+                    t = ln.split()
+                    if len(t) < 2:
+                        continue
+                    try:
+                        a, b = float(t[0]), float(t[1])
+                        c = float(t[2]) if len(t) > 2 else 0.0
+                    except ValueError:
+                        continue
+                    if a > 0:
+                        rows.append((a, b, c))
+                if len(rows) >= 2:
+                    return rows
+            return None
+
+        def a_py(lam_nm: float) -> float:
+            tau = 0.0
+            for i, L in enumerate(ref_spec.device.layers):
+                tab = _tab(L.material or L.name)
+                if tab is None or (L.is_contact and i > 0):
+                    continue
+                lu = min(max(lam_nm * 1e-3, tab[0][0]), tab[-1][0])
+                k = float(np.interp(lu, [r[0] for r in tab], [r[2] for r in tab]))
+                tau += 4.0 * np.pi * k / (lam_nm * 1e-7) * L.thick_nm * 1e-7
+            return 1.0 - np.exp(-tau)
+
+        lib = PvkLib()
+        dev, _keep = st.device_from_spec(ref_spec.device)
+        ctx = lib.create()
+        lib.build_mesh(ctx, dev)
+        n_opt_nodes = lib.node_count(ctx)
+
+        def a_kernel(lam_nm: float, **kw) -> float:
+            sp = replace(ref_spec.optics, wl_nm=np.array([lam_nm]),
+                         flux=np.array([1.0]), **kw)
+            opt = st.optics_from_spec(sp)
+            out = (ct.c_double * 1)()
+            rc = lib._lib.pvk_optics_compute(ctx, ct.byref(dev), ct.byref(opt),
+                                             out, None)
+            lib._check(ctx, rc, "optics_compute")
+            return float(out[0])
+
+        for lam in (800.0, 1000.0):
+            got = a_kernel(lam, coherent=False, atlas_ray=True)
+            want = a_py(lam)
+            check(f"atlas.ray A({lam:.0f}) 与独立单程复算一致（±2%）",
+                  abs(got - want) <= 0.02 * max(want, 1e-6),
+                  f"kernel={got:.4f}, python={want:.4f}")
+
+        sp = replace(ref_spec.optics, coherent=True, atlas_ray=False)
+        opt = st.optics_from_spec(sp)
+        g = (ct.c_double * n_opt_nodes)()
+        rc = lib._lib.pvk_optics_compute(ctx, ct.byref(dev), ct.byref(opt),
+                                         None, g)
+        lib._check(ctx, rc, "optics_compute")
+        x = np.asarray(lib.get_x(ctx, n_opt_nodes))
+        gg = np.asarray(list(g))
+        qg = float(Q_E * np.sum(0.5 * (gg[1:] + gg[:-1]) * np.diff(x)) * 1e3)
+        check("coherent q∫G ∈ [30, 33] mA/cm²", 30.0 <= qg <= 33.0, f"{qg:.2f}")
+        a800 = a_kernel(800.0, coherent=True, atlas_ray=False)
+        check("coherent A(800) ∈ [0.8, 1.0]", 0.8 <= a800 <= 1.0, f"{a800:.3f}")
+        lib.destroy(ctx)
 
     print("\n参考曲线（供外部对照）")
     for inten in (10.0, 50.0, 100.0):
