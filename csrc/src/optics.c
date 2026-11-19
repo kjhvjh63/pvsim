@@ -18,7 +18,13 @@
  *   每层按材料名在目录里找 ``<material>.txt`` /
  *   ``<material>_nk_wavelength.txt`` / ``<material>_nk.txt``，文件格式为
  *   「首行点数，随后 λ(µm) n k」三列（两列时 k=0）。命中后
- *   α(λ) = 4πk/λ，并计入前表面菲涅尔反射（用首层 n 估）。
+ *   α(λ) = 4πk/λ，并做非相干多次往返：
+ *     - 入射：空气→首层，乘菲涅尔透射 (1-R_front)；
+ *     - 层间：每过一层界面乘 (1-R)，用两侧实折射率；
+ *     - 背电极：正向程结束乘金属反射率 R_back（末层有 nk 时按复折射率
+ *       从相邻半导体侧算，否则取金属典型值 0.95）；
+ *     - 内反射：反向程回到前表面时乘 R_front（不是 R_back）。
+ *   直到剩余能量 < 1e-9 入射（bounces 在这个模式里不参与限程）。
  *   文件缺失或 λ 超出数据范围时退回带隙唯象模型，保证行为连续。
  *
  * 待补：相干多光束（Atlas 的 beam 默认是射线追踪，单次往返足够做量级对照）。
@@ -290,19 +296,33 @@ PVK_API int pvk_optics_compute(pvk_ctx* ctx,
                 tau[i] = fmax(nn, 1e-3);
             }
 
-            /* 背接触（末层）反射率：有 nk 时用 ((n-1)²+k²)/((n+1)²+k²)，
-             * 否则按半吸收处理。 */
-            double n_met, k_met;
+            /* 前表面（空气→首层）与内反射（首层→空气）的菲涅尔反射率。
+             * 之前每一程结束都乘背电极反射率，导致“内部光从前表面反射”
+             * 被当成金属镜面（R=0.5）——既非物理，也把多次往返的能量
+             * 高估/低估混在一起。 */
+            double r_front = fresnel_r(1.0, tau[0]);
+
+            /* 背接触（末层）反射率。有 nk 时按复折射率、从相邻半导体
+             * 侧入射计算：R = ((n_s-n_m)²+k_m²)/((n_s+n_m)²+k_m²)。
+             * 没有 nk（复刻卡只写了 Au region，但 nk.dir 里没有 Au.txt）
+             * 时按金属典型值 0.95；旧的 0.5 无物理依据，且会把亚带隙
+             * 光（吸收长度 ~1 µm，靠背反射二次吸收）低估掉约 2 mA/cm²。 */
             int last = dev->n_layers - 1;
-            double r_back = 0.5;
+            double r_back = 0.95;
+            double n_met, k_met;
             if (last >= 0 && nk_lookup(&nks[last], lam, &n_met, &k_met) && n_met > 0.0) {
-                double a1 = (n_met - 1.0) * (n_met - 1.0) + k_met * k_met;
-                double a2 = (n_met + 1.0) * (n_met + 1.0) + k_met * k_met;
+                double n_s = 1.0;
+                for (int i = n_node - 1; i >= 0; i--) {
+                    int li = ctx->mesh.node_layer[i];
+                    if (li != last) { n_s = tau[i]; break; }
+                }
+                double a1 = (n_s - n_met) * (n_s - n_met) + k_met * k_met;
+                double a2 = (n_s + n_met) * (n_s + n_met) + k_met * k_met;
                 r_back = a1 / a2;
             }
 
             double absorbed_total = 0.0;
-            double I = phi * (1.0 - fresnel_r(1.0, tau[0]));
+            double I = phi * (1.0 - r_front);
             for (int pass = 1; pass <= 200 && I > 1e-9 * phi; pass++) {
                 int fwd = (pass % 2) == 1;
                 int i0 = fwd ? 0 : n_node - 1;
@@ -311,7 +331,12 @@ PVK_API int pvk_optics_compute(pvk_ctx* ctx,
                 for (int k = 1; k < n_node; k++) {
                     int i = i0 + st * k;
                     int j = prev;
-                    if (fabs(tau[i] - tau[j]) > 1e-6) {
+                    /* 背电极界面不在这里扣透射：金属反射已由 r_back 统一
+                     * 计入，否则会把复折射率反射算两遍（且符号相反）。 */
+                    int li_i = ctx->mesh.node_layer[i];
+                    int li_j = ctx->mesh.node_layer[j];
+                    int back_iface = (li_i == last || li_j == last);
+                    if (!back_iface && fabs(tau[i] - tau[j]) > 1e-6) {
                         I *= (1.0 - fresnel_r(tau[j], tau[i]));
                     }
                     double a = 0.5 * (alpha[j] + alpha[i]);
@@ -328,7 +353,9 @@ PVK_API int pvk_optics_compute(pvk_ctx* ctx,
                     }
                     prev = i;
                 }
-                I *= r_back;                 /* 末层界面反射，进入下一程 */
+                /* 正向到背电极 → 乘金属反射率；反向到前表面 → 乘前表面
+                 * 反射率。两者不可混用。 */
+                I *= fwd ? r_back : r_front;
             }
 
             if (out_absorb_spectrum) {
