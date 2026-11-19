@@ -18,6 +18,11 @@
      只剩 1 个节点、被电极 bc 吞并，导致 cpl 钉扎侵入吸收层，
      Jsc 塌到暗电流量级却被报成收敛。现要求 @101 与 @201 的 Jsc
      相差 <20%，且 1500nm 的 Jsc 不低于 500nm 的 70%。
+  9. Atlas 2D 对齐锚点：Cs2AgBiBr6 800nm 复刻卡与 Silvaco Atlas 的
+     Jsc/Voc/FF 偏差（5% / 100 mV / 0.10）。
+ 10. 低光锚点：同一复刻卡 1 sun → 1 mW 的 Jsc 严格线性（±2%）、Voc
+     有限且单调、1 sun 收敛点数不回退。锁住连续方程尺度化重构的成果；
+     0.1/0.01 mW 是已知未收敛区，暂不设判据。
 
 --export DIR 会把 1 sun 的 J-V 写成 SSF/.log（DeckBuild 可直接打开），
 用于和 SCAPS / Silvaco 等外部结果逐点对照。
@@ -159,8 +164,9 @@ def main() -> int:
     # Voc 100 mV、FF 0.10（当前实测 +45 mV / +0.02）。
     ref_deck = (Path(__file__).resolve().parents[2] / "decks" /
                 "cs2agbibr6_800nm_ref.tst")
-    r9 = Simulator().run(DeckCompiler().compile_text(
-        ref_deck.read_text(encoding="utf-8"))).jv
+    ref_spec = DeckCompiler().compile_text(ref_deck.read_text(encoding="utf-8"))
+    res9 = Simulator().run(ref_spec)
+    r9 = res9.jv
     AT_JSC, AT_VOC, AT_FF = 27.27, 1.1822, 0.810
     check("Jsc 与 Atlas 差 <5%", abs(r9.Jsc - AT_JSC) / AT_JSC < 0.05,
           f"ours={r9.Jsc:.2f}, atlas={AT_JSC:.2f}")
@@ -170,6 +176,32 @@ def main() -> int:
     check("FF 与 Atlas 差 <0.10",
           np.isfinite(r9.FF) and abs(r9.FF - AT_FF) < 0.10,
           f"ours={r9.FF:.4f}, atlas={AT_FF:.4f}")
+
+    print("10. 低光锚点（800nm 复刻卡，1 sun → 1 mW）")
+    # 锁住连续方程尺度化重构的成果：低光下 Jsc 必须与光强严格线性
+    # （误差来自 SRH/双分子复合的物理偏离，应 <1%），Voc 必须有限且随
+    # 光强单调；1 sun 的收敛点数不得回退（重构前 67/101，现 80/101）。
+    # 0.1/0.01 mW 仍是已知未收敛区（见 solver.c 的 cont_scale 注释），
+    # 因此不设这一档的判据。
+    def run_ref(inten: float):
+        spec = replace(ref_spec,
+                       optics=replace(ref_spec.optics, intensity_mW_cm2=inten))
+        return Simulator().run(spec)
+
+    r10, r1 = run_ref(10.0), run_ref(1.0)
+    lin10 = r10.jv.Jsc / r9.Jsc
+    lin1 = r1.jv.Jsc / r9.Jsc
+    check("Jsc(10)/Jsc(100) = 0.1（±2%）", abs(lin10 - 0.1) <= 0.002,
+          f"比值={lin10:.5f}")
+    check("Jsc(1)/Jsc(100) = 0.01（±2%）", abs(lin1 - 0.01) <= 2e-4,
+          f"比值={lin1:.6f}")
+    vocs = (r9.Voc, r10.jv.Voc, r1.jv.Voc)
+    check("Voc 有限且随光强单调",
+          all(np.isfinite(v) for v in vocs) and vocs[0] > vocs[1] > vocs[2],
+          f"{vocs[0]:.4f} > {vocs[1]:.4f} > {vocs[2]:.4f}")
+    n_conv9 = sum(p.converged for p in res9.points)
+    check("1 sun 收敛点数 ≥ 75/101", n_conv9 >= 75,
+          f"{n_conv9}/{len(res9.points)}")
 
     print("\n参考曲线（供外部对照）")
     for inten in (10.0, 50.0, 100.0):
