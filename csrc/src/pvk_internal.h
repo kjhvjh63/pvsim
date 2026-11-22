@@ -59,6 +59,10 @@ struct pvk_ctx {
     pvk_optics_in last_optics;
     pvk_bias      last_bias;
     int           inputs_valid;   /* 1 = 已被 solve 使用过 */
+    /* 1 = state.fields[G_OPT] 与 last_device/last_optics 对应的产生率剖面
+     * 一致，solve_dc 可跳过 pvk_optics_compute。build_mesh 会把所有 field
+     * 重新 calloc，必须在这里置 0。 */
+    int           optics_valid;
 
     /* ── 上次收敛解的 warm-start 标记 ──
      * fields[PSI/PHIN/PHIP] 在两次 solve_dc 之间保留，作为下一次

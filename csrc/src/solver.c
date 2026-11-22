@@ -610,78 +610,6 @@ static void residual_local(const pvk_model* m, const double* u, int i,
 }
 
 /* ─────────────────────────────────────────────────────────────────────
- * 稠密 LU（部分选主元 + 行均衡）
- * ───────────────────────────────────────────────────────────────────── */
-static int dense_solve(double* A, double* b, int nn) {
-    for (int i = 0; i < nn; i++) {
-        double* row = A + (size_t)i * nn;
-        double s = 0.0;
-        for (int j = 0; j < nn; j++) {
-            double v = fabs(row[j]);
-            if (v > s) s = v;
-        }
-        if (!(s > 1e-290) || !isfinite(s)) {
-            if (getenv("PVK_DEBUG")) fprintf(stderr, "[pvk] row %d degenerate s=%g (freeze)\n", i, s);
-            /* 整行全零：该方程在这点上不约束任何变量（载流子已到
-             * 数值下溢区），把它换成 du_i = 0，即冻结该未知量。 */
-            for (int j = 0; j < nn; j++) row[j] = 0.0;
-            row[i] = 1.0;
-            b[i] = 0.0;
-            continue;
-        }
-        double inv = 1.0 / s;
-        for (int j = 0; j < nn; j++) row[j] *= inv;
-        b[i] *= inv;
-    }
-
-    /* 对角加一点正则：少数载流子在强掺杂层里处于 ~1e-40 量级时，对应的
-     * 准费米未知量在残差里几乎不出现，矩阵数值上是奇异的。加 1e-10 的
-     * 对角项（相对于行均衡后的 O(1) 尺度）只影响这些零空间方向，给出
-     * 一个极小的步长，不改变可解方向。 */
-    for (int i = 0; i < nn; i++) A[(size_t)i * nn + i] += 1e-10;
-
-    for (int k = 0; k < nn; k++) {
-        int piv = k;
-        double best = fabs(A[(size_t)k * nn + k]);
-        for (int i = k + 1; i < nn; i++) {
-            double v = fabs(A[(size_t)i * nn + k]);
-            if (v > best) { best = v; piv = i; }
-        }
-        if (!(best > 1e-14) || !isfinite(best)) {
-            if (getenv("PVK_DEBUG")) fprintf(stderr, "[pvk] pivot k=%d best=%g\n", k, best);
-            return -1;
-        }
-        if (piv != k) {
-            double* ra = A + (size_t)k * nn;
-            double* rb = A + (size_t)piv * nn;
-            for (int j = 0; j < nn; j++) { double t = ra[j]; ra[j] = rb[j]; rb[j] = t; }
-            double t = b[k]; b[k] = b[piv]; b[piv] = t;
-        }
-        double akk = A[(size_t)k * nn + k];
-        double* rk = A + (size_t)k * nn;
-        for (int i = k + 1; i < nn; i++) {
-            double* ri = A + (size_t)i * nn;
-            double f = ri[k] / akk;
-            if (f == 0.0) continue;
-            ri[k] = 0.0;
-            for (int j = k + 1; j < nn; j++) ri[j] -= f * rk[j];
-            b[i] -= f * b[k];
-        }
-    }
-
-    for (int i = nn - 1; i >= 0; i--) {
-        double s = b[i];
-        double* ri = A + (size_t)i * nn;
-        for (int j = i + 1; j < nn; j++) s -= ri[j] * b[j];
-        b[i] = s / ri[i];
-    }
-    for (int i = 0; i < nn; i++) {
-        if (!isfinite(b[i])) return -1;
-    }
-    return 0;
-}
-
-/* ─────────────────────────────────────────────────────────────────────
  * 带状 LU（部分选主元）
  *
  * 残差按（方程类型 t, 节点 i）排列、未知量按（变量类型 s, 节点 j）排列时，
@@ -763,6 +691,93 @@ static int band_solve(int nn, double* ab, double* b) {
         for (int c = i + 1; c <= cmax; c++)
             s -= ab[(size_t)i * w + (c - i + PVK_BW_L)] * b[c];
         double aii = ab[(size_t)i * w + PVK_BW_L];
+        if (!(fabs(aii) > 1e-300) || !isfinite(aii)) return -1;
+        b[i] = s / aii;
+    }
+    for (int i = 0; i < nn; i++) if (!isfinite(b[i])) return -1;
+    return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+ * 三对角 LU（部分选主元）
+ *
+ * 平衡态 Poisson 只有 ψ 一个未知量，每个方程只耦合 i-1,i,i+1。
+ * 部分选主元会让上带宽增长到 2，所以按 BL=1、BU=2 存 4 条对角线：
+ *   ab[i*4 + (c - i + 1)]
+ * 复杂度 O(n)，替代原来 dense_solve 的 O(n^3)。行均衡 / 对角正则 /
+ * 奇异行冻结的语义与 band_solve 保持一致。
+ * ───────────────────────────────────────────────────────────────────── */
+#define PVK_TRI_W 4
+static int tri_solve(int nn, double* ab, double* b) {
+    const int w = PVK_TRI_W;
+
+    for (int i = 0; i < nn; i++) {
+        double* row = ab + (size_t)i * w;
+        double s = 0.0;
+        for (int k = 0; k < w; k++) {
+            double v = fabs(row[k]);
+            if (v > s) s = v;
+        }
+        if (!(s > 1e-290) || !isfinite(s)) {
+            if (getenv("PVK_DEBUG"))
+                fprintf(stderr, "[pvk] tri row %d degenerate (freeze)\n", i);
+            for (int k = 0; k < w; k++) row[k] = 0.0;
+            row[1] = 1.0;
+            b[i] = 0.0;
+            continue;
+        }
+        double inv = 1.0 / s;
+        for (int k = 0; k < w; k++) row[k] *= inv;
+        b[i] *= inv;
+    }
+    for (int i = 0; i < nn; i++) ab[(size_t)i * w + 1] += 1e-10;
+
+    for (int k = 0; k < nn; k++) {
+        int rmax = k + 1;
+        if (rmax >= nn) rmax = nn - 1;
+        int piv = k;
+        double best = fabs(ab[(size_t)k * w + 1]);
+        for (int r = k + 1; r <= rmax; r++) {
+            double v = fabs(ab[(size_t)r * w + (k - r + 1)]);
+            if (v > best) { best = v; piv = r; }
+        }
+        if (!(best > 1e-14) || !isfinite(best)) return -1;
+        if (piv != k) {
+            /* 列 c<k 在消元后已显式置零，只需交换 c>=k 的部分 */
+            int c0 = piv - 1;
+            if (c0 < 0) c0 = 0;
+            int c1 = k + 2;
+            if (c1 >= nn) c1 = nn - 1;
+            for (int c = c0; c <= c1; c++) {
+                double* rk = ab + (size_t)k   * w + (c - k   + 1);
+                double* rp = ab + (size_t)piv * w + (c - piv + 1);
+                double t = *rk; *rk = *rp; *rp = t;
+            }
+            double t = b[k]; b[k] = b[piv]; b[piv] = t;
+        }
+        double akk = ab[(size_t)k * w + 1];
+        int i = k + 1;
+        if (i >= nn) continue;
+        double f = ab[(size_t)i * w + (k - i + 1)] / akk;
+        if (f != 0.0) {
+            ab[(size_t)i * w + (k - i + 1)] = 0.0;
+            int cmax = k + 2;
+            if (cmax >= nn) cmax = nn - 1;
+            if (i + 2 < cmax) cmax = i + 2;
+            for (int c = k + 1; c <= cmax; c++)
+                ab[(size_t)i * w + (c - i + 1)] -=
+                    f * ab[(size_t)k * w + (c - k + 1)];
+            b[i] -= f * b[k];
+        }
+    }
+
+    for (int i = nn - 1; i >= 0; i--) {
+        double s = b[i];
+        int cmax = i + 2;
+        if (cmax >= nn) cmax = nn - 1;
+        for (int c = i + 1; c <= cmax; c++)
+            s -= ab[(size_t)i * w + (c - i + 1)] * b[c];
+        double aii = ab[(size_t)i * w + 1];
         if (!(fabs(aii) > 1e-300) || !isfinite(aii)) return -1;
         b[i] = s / aii;
     }
@@ -1120,15 +1135,21 @@ static int solve_newton(pvk_model* m, double* u,
     int converged = 0;
     int iters = 0;
     int status = PVK_OK;
-    double rel_prev = 1e300, rel_prev2 = 1e300;
-    /* 额外预算：高偏压时 2-范数收敛慢（rel 每步只降 ~11%），60 步
-     * 常常只差 1–2 步。只有当 rel<1e-2 且仍在下降（>2%/步）时才允许
-     * 用到这 20 步，避免真发散的算例白白多算。 */
+    /* 预算：默认 maxit+20；只要残差仍在明显下降，就每 20 步再续 20 步，
+     * 上限 4×maxit。
+     *
+     * 高偏压（>Voc）处 2-范数以 ~3%/步线性下降，200 步只够从 1e13 降到
+     * ~1e3；旧逻辑（仅当 rel<1e-2 且 >2%/步时才多给 20 步）在 220 步判
+     * 失败，随后触发 continuation 折半 + 冷启动重试风暴 —— 401/801 节点
+     * 的 J-V 里有 76%~94% 的时间花在这上面。实测 maxit=800 时 401/801
+     * 的 1.34~1.40 V 全部首次尝试即收敛（401@1.40 用 699 步），且 J 与
+     * 细网格一致到 0.3%，说明解本身没问题、只是预算不够。 */
     int maxit_ext = maxit + 20;
+    int maxit_cap = maxit * 4;
+    if (maxit_cap < maxit_ext) maxit_cap = maxit_ext;
+    double rn_chk = rn;
 
     for (int it = 0; it < maxit_ext; it++) {
-        if (it >= maxit &&
-            !(rel_prev < 1e-2 && rel_prev < 0.98 * rel_prev2)) break;
         if (rn < tol) { converged = 1; break; }
 
         if (getenv("PVK_DEBUG"))
@@ -1275,7 +1296,12 @@ static int solve_newton(pvk_model* m, double* u,
          * 必须同时要求 rn < 1e3：rel 只保证"相对当地通量"守恒，若某个
          * 局部通量被算得极大（错误解），rel 也可以很小。加上这条，低偏压
          * 下 rn~1e19 的病态解不会被误当成收敛（101/refine=1 的 J-V 曾
-         * 因此出现 J 符号乱跳）。 */
+         * 因此出现 J 符号乱跳）。
+         *
+         * 不要放宽这个门槛：实测放到 1e6 会让 0.3~1.1 V 的点提前放行
+         * （rel<1e-3 但 rn~1e4），J 系统性偏低 0.5%~4%，FF 掉 1.4 个点。
+         * 高偏压的收敛问题由上面的预算续期解决 —— 续到 800 步时 401/801
+         * 的 1.34~1.40 V 都能把 rn 压到 ~997（刚好在 1e3 以下）。 */
         {
             double rel_now = 0.0, hid_now = 0.0;
             residual(m, u, utmp, nb2, pb2, rn2, &rel_now, &hid_now);
@@ -1286,8 +1312,6 @@ static int solve_newton(pvk_model* m, double* u,
             if (converged && getenv("PVK_DEBUG"))
                 fprintf(stderr, "[pvk] relaxed accept: rel=%.2e rn=%.2e hid=%.2e\n",
                         rel_now, rn, hid_now);
-            rel_prev2 = rel_prev;
-            rel_prev = rel_now;
             if (converged) break;
         }
 
@@ -1302,6 +1326,12 @@ static int solve_newton(pvk_model* m, double* u,
                 fprintf(stderr, "[pvk] 步长停滞但 rel=%.3e hid=%.3e，判为未收敛\n",
                         rel_now, hid_now);
             break;
+        }
+
+        /* 预算续期：每 20 步检查一次，残差至少降 20% 才续。 */
+        if (it + 1 >= maxit_ext && maxit_ext < maxit_cap && rn < 0.8 * rn_chk) {
+            maxit_ext += 20;
+            rn_chk = rn;
         }
     }
 
@@ -1417,6 +1447,21 @@ static double eq_residual(const pvk_model* m, const double* u, double* r,
     return sqrt(rsum2 / (double)n);
 }
 
+/* 单行 Poisson 残差 —— 与 eq_residual 里的 r[i] 逐项一致。
+ * 只依赖 u[i-1..i+1] 与当地 nb[i]/pb[i]，所以数值雅可比扰动 u[j] 时
+ * 只有 j-1..j+1 三行会变，邻居的密度数组可以复用（O(n) 组装）。 */
+static double eq_row(const pvk_model* m, const double* u, int i,
+                     const double* nb, const double* pb) {
+    if (m->bc[i]) return u[i] - m->u_bc[m->bc[i] - 1];
+    double Vt = m->Vt;
+    double hL = m->h[i-1], hR = m->h[i], hc = m->hc[i];
+    double fluxR = m->eps[i+1] * (u[i+1] - u[i]) * Vt / hR;
+    double fluxL = m->eps[i]   * (u[i]   - u[i-1]) * Vt / hL;
+    double ft = (fluxR - fluxL) / (PVK_Q_C * hc);
+    double ct = pb[i] - nb[i] + m->Nd[i] - m->Na[i];
+    return ft + ct;
+}
+
 /* 电中性初值：按层解 A·e^u - B·e^-u = Nd - Na */
 static void eq_neutral_guess(const pvk_model* m, double* u) {
     int n = m->n;
@@ -1454,9 +1499,9 @@ static double solve_poisson_newton(const pvk_model* m, double* u,
     double* pb = (double*)pvk__malloc(sizeof(double) * n);
     double* nb2 = (double*)pvk__malloc(sizeof(double) * n);
     double* pb2 = (double*)pvk__malloc(sizeof(double) * n);
-    double* A  = (double*)pvk__malloc(sizeof(double) * (size_t)n * n);
+    double* ab = (double*)pvk__malloc(sizeof(double) * PVK_TRI_W * (size_t)n);
     double* du = (double*)pvk__malloc(sizeof(double) * n);
-    if (!r || !rt || !ut || !nb || !pb || !nb2 || !pb2 || !A || !du) goto done_free;
+    if (!r || !rt || !ut || !nb || !pb || !nb2 || !pb2 || !ab || !du) goto done_free;
 
     double tol = opts && opts->res_tol > 0 ? opts->res_tol : 1e-8;
     double rr = 1e300;
@@ -1467,18 +1512,30 @@ static double solve_poisson_newton(const pvk_model* m, double* u,
      * 会在 1e-8 就放行（此时界面节点的通量还差 ~80%），亮态随后发散；
      * 只用 rr 则线搜索不下降（见 eq_residual 的注释）。 */
     for (int it = 0; it < 80 && (rn > tol || rr > 1e-3); it++) {
+        memset(ab, 0, sizeof(double) * PVK_TRI_W * (size_t)n);
+        /* 数值雅可比（前向差分）：Poisson 每行只耦合 i-1..i+1，所以
+         * 扰动 u[j] 只重算 j-1..j+1 三行，O(n)（旧版每列都重扫全器件
+         * 是 O(n^2)，再叠加 dense_solve 的 O(n^3)）。 */
         for (int j = 0; j < n; j++) {
             double save = u[j];
+            double sn = nb[j], sp = pb[j];
             double hstep = 1e-7 * (fabs(save) > 1.0 ? fabs(save) : 1.0);
             u[j] = save + hstep;
-            eq_residual(m, u, rt, nb2, pb2, NULL);
-            u[j] = save;
+            eq_dens(m, j, u[j], &nb[j], &pb[j]);
+            if (!isfinite(nb[j])) nb[j] = 1e300;
+            if (!isfinite(pb[j])) pb[j] = 1e300;
             double inv = 1.0 / hstep;
-            for (int i = 0; i < n; i++) A[(size_t)i * n + j] = (rt[i] - r[i]) * inv;
+            for (int i = j - 1; i <= j + 1; i++) {
+                if (i < 0 || i >= n) continue;
+                ab[(size_t)i * PVK_TRI_W + (j - i + 1)] =
+                    (eq_row(m, u, i, nb, pb) - r[i]) * inv;
+            }
+            u[j] = save;
+            nb[j] = sn; pb[j] = sp;
         }
         for (int i = 0; i < n; i++) du[i] = -r[i];
-        if (dense_solve(A, du, n) != 0) {
-            if (getenv("PVK_DEBUG")) fprintf(stderr, "[pvk] eq: dense_solve failed it=%d\n", it);
+        if (tri_solve(n, ab, du) != 0) {
+            if (getenv("PVK_DEBUG")) fprintf(stderr, "[pvk] eq: tri_solve failed it=%d\n", it);
             break;
         }
 
@@ -1522,6 +1579,10 @@ static double solve_poisson_newton(const pvk_model* m, double* u,
         }
         memcpy(u, ut, sizeof(double) * n);
         for (int i = 0; i < n; i++) r[i] = rt[i];
+        /* nb2/pb2 是线搜索那次 eq_residual 在 ut 上算的密度，必须同步回来：
+         * 下一步的局部雅可比要复用它（旧版每列都重算全器件，所以不需要）。 */
+        memcpy(nb, nb2, sizeof(double) * n);
+        memcpy(pb, pb2, sizeof(double) * n);
         rn = rnew;
         rr = rrnew;
         /* 注意：不能用 du[0] 判停 —— 节点 0 是钉死的 Dirichlet 行，
@@ -1541,7 +1602,7 @@ static double solve_poisson_newton(const pvk_model* m, double* u,
 done_free:
     pvk__free(r); pvk__free(rt); pvk__free(ut);
     pvk__free(nb); pvk__free(pb); pvk__free(nb2); pvk__free(pb2);
-    pvk__free(A); pvk__free(du);
+    pvk__free(ab); pvk__free(du);
     return rn;
 }
 
@@ -2078,6 +2139,44 @@ static void store_guess(pvk_ctx* ctx, const pvk_model* m, const double* u) {
 /* 冷启动重试的递归深度（只为防无限递归；正常最多 1 层）。 */
 static int g_retry_depth = 0;
 
+/* 上一次 optics_compute 的输入是否与本次相同（device + optics）。
+ * 只做逐字段比较；wl_nm/flux 只比指针（调用方在整个扫描里复用同一组
+ * numpy 数组，而解引用 last_optics 里借用的指针可能已经悬空）。 */
+static int same_optics_inputs(const pvk_ctx* ctx, const pvk_device* dev,
+                              const pvk_optics_in* opt) {
+    if (!ctx->inputs_valid || !ctx->optics_valid) return 0;
+    const pvk_device* d0 = &ctx->last_device;
+    if (d0->layers == NULL || d0->n_layers != dev->n_layers) return 0;
+    if (d0->T_K != dev->T_K || d0->nodes != dev->nodes ||
+        d0->interface_refine != dev->interface_refine) return 0;
+    for (int i = 0; i < dev->n_layers; i++) {
+        const pvk_layer* a = &d0->layers[i];
+        const pvk_layer* b = &dev->layers[i];
+        if (a->thick_nm != b->thick_nm || a->eps_r != b->eps_r ||
+            a->Eg_eV != b->Eg_eV || a->chi_eV != b->chi_eV ||
+            a->Nc_cm3 != b->Nc_cm3 || a->Nv_cm3 != b->Nv_cm3 ||
+            a->mun_cm2Vs != b->mun_cm2Vs || a->mup_cm2Vs != b->mup_cm2Vs ||
+            a->taun_s != b->taun_s || a->taup_s != b->taup_s ||
+            a->Nd_cm3 != b->Nd_cm3 || a->Na_cm3 != b->Na_cm3 ||
+            a->is_contact != b->is_contact || a->is_gen != b->is_gen ||
+            a->b_rad_cm3_s != b->b_rad_cm3_s) return 0;
+        /* material 决定 n,k 查表 */
+        if ((a->material == NULL) != (b->material == NULL)) return 0;
+        if (a->material && strcmp(a->material, b->material) != 0) return 0;
+    }
+    const pvk_optics_in* o0 = &ctx->last_optics;
+    if (o0->n_wl != opt->n_wl ||
+        o0->intensity_mW_cm2 != opt->intensity_mW_cm2 ||
+        o0->bounces != opt->bounces ||
+        o0->bandgap_mask != opt->bandgap_mask ||
+        o0->coherent != opt->coherent || o0->atlas_ray != opt->atlas_ray)
+        return 0;
+    if (o0->wl_nm != opt->wl_nm || o0->flux != opt->flux) return 0;
+    if ((o0->nk_dir == NULL) != (opt->nk_dir == NULL)) return 0;
+    if (o0->nk_dir && strcmp(o0->nk_dir, opt->nk_dir) != 0) return 0;
+    return 1;
+}
+
 PVK_API int pvk_solve_dc(pvk_ctx* ctx,
                          const pvk_device* dev,
                          const pvk_optics_in* opt,
@@ -2086,19 +2185,26 @@ PVK_API int pvk_solve_dc(pvk_ctx* ctx,
     if (!ctx || !dev || !opt || !bias || !out_info) return PVK_EINVAL;
     if (dev->n_layers <= 0 || dev->layers == NULL) return PVK_EINVAL;
 
+    int optics_dirty = !same_optics_inputs(ctx, dev, opt);
     if (!mesh_matches(ctx, dev)) {
         int rc = pvk_build_mesh(ctx, dev);
         if (rc != PVK_OK) return rc;
+        optics_dirty = 1;
     }
     pvk__cache_inputs(ctx, dev, opt, bias);
 
-    /* 光学：每次重算产生率剖面（intensity=0 时 G 全零） */
+    /* 光学：只在 device/optics 变化时重算（141 点扫描里省 0.6~1.1 s，
+     * 201 节点时这一项占端到端 16%）。intensity=0 时 G 全零。 */
     if (opt->n_wl > 0 && opt->wl_nm && opt->flux) {
-        int rc = pvk_optics_compute(ctx, dev, opt, NULL, NULL);
-        if (rc != PVK_OK) return rc;
+        if (optics_dirty) {
+            int rc = pvk_optics_compute(ctx, dev, opt, NULL, NULL);
+            if (rc != PVK_OK) return rc;
+        }
+        ctx->optics_valid = 1;
     } else {
         double* g = ctx->state.fields[PVK_FIELD_G_OPT];
         if (g) memset(g, 0, sizeof(double) * ctx->mesh.n_node);
+        ctx->optics_valid = 1;
     }
 
     int n = ctx->mesh.n_node;
@@ -2360,8 +2466,29 @@ PVK_API int pvk_solve_dc(pvk_ctx* ctx,
         }
 
         if (!good) {
-            step *= 0.5;
-            if (fabs(step) < 0.005) break;
+            /* 折半步长只有折到"目标真的变了"才有意义：
+             *   0.01 V 的扫描从 1.35 走向 1.36 时，step 0.2..0.0125 都会
+             *   被夹到同一个 1.36 V，重跑只是同一个 Newton（实测 rn 轨迹
+             *   逐位相同）；折到 0.00625 才出现中间点 1.35625 V，是有用
+             *   的一步。这里一次折到出现新目标为止，省掉中间的重复。 */
+            double gap = fabs(V_app - V_cur);
+            double next = step;
+            int moved = 0;
+            for (int t = 0; t < 12; t++) {
+                next *= 0.5;
+                if (fabs(next) < 0.005) break;
+                double Vnext;
+                if (gap < 1e-9) {
+                    Vnext = V_app;
+                } else {
+                    Vnext = V_cur + next;
+                    if ((V_app - Vnext) * next <= 0.0) Vnext = V_app;
+                    if (fabs(Vnext - V_cur) < 1e-12) Vnext = V_app;
+                }
+                if (fabs(Vnext - Vk) >= 1e-12) { moved = 1; break; }
+            }
+            if (!moved) break;
+            step = next;
             continue;
         }
 

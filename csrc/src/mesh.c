@@ -229,6 +229,7 @@ PVK_API int pvk_build_mesh(pvk_ctx* ctx, const pvk_device* dev) {
     ctx->mesh.sig_total_nm = total_cm * 1e7;
     ctx->have_solution     = 0;   /* 网格换了，旧解作废 */
     ctx->cpl_prev_n        = 0;   /* 接触层掩码也按新网格重算 */
+    ctx->optics_valid      = 0;   /* field 缓存已重建，G_OPT 需重算 */
 
     pvk__free(frac);
     pvk__free(per_layer);
