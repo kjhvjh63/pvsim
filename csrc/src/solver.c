@@ -2259,12 +2259,28 @@ PVK_API int pvk_solve_dc(pvk_ctx* ctx,
         const int ndaux = (int)(sizeof(daux) / sizeof(daux[0]));
         int seeded = 0;
 
+        /* 种子按与目标偏压的距离排序：先试离目标最近的。
+         * 否则 0 V 目标会从 0.15 V 种子一路往下爬（801 节点上这一串失败
+         * 尝试约 4400 次 Newton、6.7 s，占整条 J-V 的一半）。种子集合
+         * 不变，只是顺序变了；某个种子失败仍会落到其余种子。 */
+        double srt[sizeof(seeds) / sizeof(seeds[0])];
+        for (int i2 = 0; i2 < nseed; i2++) srt[i2] = seeds[i2];
+        for (int a = 1; a < nseed; a++) {
+            double key = srt[a];
+            int b = a - 1;
+            while (b >= 0 && fabs(srt[b] - V_app) > fabs(key - V_app)) {
+                srt[b + 1] = srt[b];
+                b--;
+            }
+            srt[b + 1] = key;
+        }
+
         int dark = 1;
         for (int i = 0; i < n; i++) if (ctx->state.fields[PVK_FIELD_G_OPT] &&
                                        ctx->state.fields[PVK_FIELD_G_OPT][i] > 0.0) dark = 0;
 
         for (int si = 0; si < nseed && !seeded; si++) {
-            double V_seed = seeds[si];
+            double V_seed = srt[si];
 
             for (int md = 0; md < 2 && !seeded; md++) {
                 model_free(&m);
