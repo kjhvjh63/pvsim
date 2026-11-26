@@ -900,6 +900,8 @@ static int pvk2d_newton(pvk2d_ctx* c, double V, const double* G,
                     "Vt|dlnY|=%.2e Vt|dlnZ|=%.2e\n", it, base, V,
                     mp, c->Vt * my, c->Vt * mz);
         }
+        /* 保留未裁剪方向：逐分量裁剪失败时改沿该方向整体缩放 */
+        memcpy(c->du2, c->du, sizeof(double) * (size_t)c->n3);
         for (i = 0; i < N; ++i) {
             c->du[i] = clampd(c->du[i], -0.3, 0.3);
             c->du[N + i] = clampd(c->du[N + i], -30.0, 30.0);
@@ -954,14 +956,57 @@ static int pvk2d_newton(pvk2d_ctx* c, double V, const double* G,
                 lam *= 0.5;
             }
             if (!got) {
-                /* 回滚本步 */
+                /* 逐分量裁剪会破坏 Newton 方向：极端贫化节点需要 Δln≈50，
+                 * 而线性化在其它节点给出 1e14+ 的垃圾分量，裁剪后的方向
+                 * 已不是下降方向。改沿未裁剪方向整体缩放（ψ≤0.5 V、
+                 * ln≤3 每步，再线搜索）——小步长下必为下降方向。 */
+                double ap = 0.0, ay = 0.0, az = 0.0, lam0, rawfull;
+                int g2;
                 for (i = 0; i < N; ++i) {
-                    psi[i] = c->psi_bak[i];
-                    Yn[i] = c->Yn_bak[i];
-                    Zp[i] = c->Zp_bak[i];
+                    double a = fabs(c->du2[i]);
+                    double b = fabs(c->du2[N + i]);
+                    double d = fabs(c->du2[2 * N + i]);
+                    if (a > ap) ap = a;
+                    if (b > ay) ay = b;
+                    if (d > az) az = d;
                 }
-                *res_out = base; *it_out = it;
-                return 0;
+                rawfull = ap;
+                if (c->Vt * ay > rawfull) rawfull = c->Vt * ay;
+                if (c->Vt * az > rawfull) rawfull = c->Vt * az;
+                lam0 = 1.0;
+                if (0.5 / (ap > 1e-30 ? ap : 1e-30) < lam0)
+                    lam0 = 0.5 / (ap > 1e-30 ? ap : 1e-30);
+                if (3.0 / (ay > 1e-30 ? ay : 1e-30) < lam0)
+                    lam0 = 3.0 / (ay > 1e-30 ? ay : 1e-30);
+                if (3.0 / (az > 1e-30 ? az : 1e-30) < lam0)
+                    lam0 = 3.0 / (az > 1e-30 ? az : 1e-30);
+                lam = lam0;
+                for (g2 = 0; g2 < 24; ++g2) {
+                    for (i = 0; i < N; ++i) {
+                        psi[i] = c->psi_bak[i] + lam * c->du2[i];
+                        Yn[i] = c->Yn_bak[i] * exp(lam * c->du2[N + i]);
+                        Zp[i] = c->Zp_bak[i] * exp(lam * c->du2[2 * N + i]);
+                    }
+                    pvk2d_apply_pins(c, V, psi, Yn, Zp);
+                    pvk2d_assemble(c, V, G, psi, Yn, Zp, c->rtmp, 0);
+                    rt = residual_max_scaled(c, c->rtmp);
+                    if (isfinite(rt) && (rt <= base || rt < 1e-30)) {
+                        got = 1;
+                        upd_full = rawfull;
+                        break;
+                    }
+                    lam *= 0.5;
+                }
+                if (!got) {
+                    /* 回滚本步 */
+                    for (i = 0; i < N; ++i) {
+                        psi[i] = c->psi_bak[i];
+                        Yn[i] = c->Yn_bak[i];
+                        Zp[i] = c->Zp_bak[i];
+                    }
+                    *res_out = base; *it_out = it;
+                    return 0;
+                }
             }
         }
         if (rt < 1e-30) rt = 1e-30;
@@ -1047,6 +1092,7 @@ int pvk2d_solve(pvk2d_ctx* c, double V, pvk2d_info* info) {
         int rc = pvk2d_compute_equilibrium(c);
         if (rc != PVK_OK) return rc;
     }
+    int from_eq = c->need_seed;      /* 本次是否从平衡态冷启动 */
     if (c->need_seed) {
         /* 光生载流子初值（只改初值）：n≈G·τ */
         c->need_seed = 0;
@@ -1069,6 +1115,30 @@ int pvk2d_solve(pvk2d_ctx* c, double V, pvk2d_info* info) {
         }
     }
     ok = pvk2d_newton(c, V, c->G, c->psi, c->Yn, c->Zp, 80, 1e-9, &res, &it);
+    if (!ok && from_eq && c->G) {
+        /* 光强 ramp 回退（与 Python fv2d.solve 同一序列）：从平衡态按
+         * 1e-10…1 的几何序列逐步升光强，每步暖启动。细化网格下首步全光照
+         * 的线性化跨 20+ 个量级，直接解会失败；逐步升光强每步跨 ~1 个
+         * 量级，稳定收敛。 */
+        double* gs = (double*)pvk2d_alloc(sizeof(double) * (size_t)c->N);
+        int k, ramp_ok = 1;
+        if (!gs) return PVK_EMEM;
+        if (pvk2d_compute_equilibrium(c) != PVK_OK) {
+            ramp_ok = 0;
+        }
+        for (k = 0; k < 11 && ramp_ok; ++k) {
+            double alpha = pow(10.0, -10.0 + (double)k);
+            int i;
+            for (i = 0; i < c->N; ++i) gs[i] = c->G[i] * alpha;
+            if (!pvk2d_newton(c, V, gs, c->psi, c->Yn, c->Zp,
+                              80, 1e-9, &res, &it)) {
+                ramp_ok = 0;
+            }
+        }
+        free(gs);
+        c->need_seed = 0;
+        ok = ramp_ok;
+    }
     if (info) {
         info->n_node = c->N;
         info->J_mA_cm2 = ok ? pvk2d_current(c) * 1e3 : 0.0;
