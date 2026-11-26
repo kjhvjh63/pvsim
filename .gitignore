@@ -1,5 +1,5 @@
 # C 内核构建产物（CMake + MinGW）
-csrc/build/
+csrc/build*/
 
 # Python 缓存
 __pycache__/
