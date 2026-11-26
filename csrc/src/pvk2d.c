@@ -635,28 +635,38 @@ static void matvec(pvk2d_ctx* c, const double* x, double* y) {
     }
 }
 
-static int pvk2d_bicgstab(pvk2d_ctx* c, const double* b, double* x, int maxit, double tol) {
+static int pvk2d_bicgstab(pvk2d_ctx* c, const double* b, double* x, int maxit,
+                          double tol, int resume) {
     int n = c->n3, it, i;
     double bn = norm2(b, n);
     double *r = c->w1, *r0 = c->w2, *p = c->w3, *v = c->w4,
            *s = c->w5, *t = c->w6, *ph = c->rtmp, *sh = c->rbuf;
     double rho = 1.0, alpha = 1.0, omega = 1.0;
     if (bn == 0.0) { memset(x, 0, sizeof(double) * (size_t)n); return 0; }
-    memset(x, 0, sizeof(double) * (size_t)n);
-    memcpy(r, b, sizeof(double) * (size_t)n);
-    memcpy(r0, b, sizeof(double) * (size_t)n);
+    if (resume) {
+        /* 重启：保留当前 x，用它的真实残差作新的影子残差（停滞常见解法） */
+        matvec(c, x, r);
+        for (i = 0; i < n; ++i) r[i] = b[i] - r[i];
+    } else {
+        memset(x, 0, sizeof(double) * (size_t)n);
+        memcpy(r, b, sizeof(double) * (size_t)n);
+    }
+    memcpy(r0, r, sizeof(double) * (size_t)n);
     memset(p, 0, sizeof(double) * (size_t)n);
     memset(v, 0, sizeof(double) * (size_t)n);
     for (it = 0; it < maxit; ++it) {
         double rho1 = dot(r0, r, n);
-        double beta, rn;
-        if (fabs(rho) < 1e-300) break;
+        double beta, rn, den;
+        if (!isfinite(rho1) || fabs(rho) < 1e-300) break;
+        if (!isfinite(alpha) || fabs(omega) < 1e-300) break;
         beta = (rho1 / rho) * (alpha / omega);
         rho = rho1;
         for (i = 0; i < n; ++i) p[i] = r[i] + beta * (p[i] - omega * v[i]);
         pvk2d_ilu_solve(c, p, ph);
         matvec(c, ph, v);
-        alpha = rho / dot(r0, v, n);
+        den = dot(r0, v, n);
+        if (!isfinite(den) || fabs(den) < 1e-300) break;
+        alpha = rho / den;
         for (i = 0; i < n; ++i) s[i] = r[i] - alpha * v[i];
         rn = norm2(s, n);
         if (rn / bn < tol) {
@@ -666,6 +676,7 @@ static int pvk2d_bicgstab(pvk2d_ctx* c, const double* b, double* x, int maxit, d
         pvk2d_ilu_solve(c, s, sh);
         matvec(c, sh, t);
         omega = dot(t, s, n) / fmax(dot(t, t, n), 1e-300);
+        if (!isfinite(omega) || fabs(omega) < 1e-300) break;
         for (i = 0; i < n; ++i) x[i] += alpha * ph[i] + omega * sh[i];
         for (i = 0; i < n; ++i) r[i] = s[i] - omega * t[i];
         if (norm2(r, n) / bn < tol) return it + 1;
@@ -673,6 +684,185 @@ static int pvk2d_bicgstab(pvk2d_ctx* c, const double* b, double* x, int maxit, d
     if (getenv("PVK2D_DEBUG"))
         fprintf(stderr, "[pvk2d] bicgstab exhausted: rel=%.2e\n", norm2(r, n) / bn);
     return -1;
+}
+
+/* 对角预条件：就地除以 ILU 的 U 对角 */
+static void pvk2d_jacobi_solve(pvk2d_ctx* c, double* x) {
+    int i, n = c->n3;
+    int* diag = (int*)c->diagpos;
+    for (i = 0; i < n; ++i) {
+        double d = c->lu[diag[i]];
+        if (fabs(d) > 1e-300) x[i] /= d;
+    }
+}
+
+/* GMRES(m) + 右预条件：用于高偏压下病态 Jacobian 上 ILU0-BiCGSTAB 停滞
+ * （实测 FG010 在 1.13 V 起 800 步只到 8.6e-4）。use_ilu=1 用 ILU(0)，
+ * 否则用对角预条件；两者都失败则由上层退回预条件方向作近似步。 */
+static int pvk2d_gmres(pvk2d_ctx* c, const double* b, double* x,
+                       int restart, int maxit, double tol, int use_ilu) {
+    int n = c->n3, i, j, k, it = 0, m, ret = -1;
+    size_t vn = (size_t)(restart + 1) * (size_t)n;
+    double bn = norm2(b, n);
+    double *V = NULL, *Z = NULL, *H = NULL, *cs = NULL, *sn = NULL;
+    double *g = NULL, *y = NULL, *w = NULL, *r = NULL, *z = NULL;
+    if (bn == 0.0) {
+        memset(x, 0, sizeof(double) * (size_t)n);
+        return 0;
+    }
+    V = (double*)pvk2d_alloc(sizeof(double) * vn);
+    Z = (double*)pvk2d_alloc(sizeof(double) * (size_t)restart * (size_t)n);
+    H = (double*)pvk2d_alloc(sizeof(double) * (size_t)(restart + 1)
+                             * (size_t)restart);
+    cs = (double*)pvk2d_alloc(sizeof(double) * (size_t)restart);
+    sn = (double*)pvk2d_alloc(sizeof(double) * (size_t)restart);
+    g = (double*)pvk2d_alloc(sizeof(double) * (size_t)(restart + 1));
+    y = (double*)pvk2d_alloc(sizeof(double) * (size_t)restart);
+    w = (double*)pvk2d_alloc(sizeof(double) * (size_t)n);
+    r = (double*)pvk2d_alloc(sizeof(double) * (size_t)n);
+    z = (double*)pvk2d_alloc(sizeof(double) * (size_t)n);
+    if (!V || !Z || !H || !cs || !sn || !g || !y || !w || !r || !z) goto done;
+    memset(x, 0, sizeof(double) * (size_t)n);
+    memcpy(r, b, sizeof(double) * (size_t)n);
+    while (it < maxit) {
+        double rn = norm2(r, n);
+        if (!isfinite(rn)) break;
+        if (rn / bn <= tol) { ret = 0; break; }
+        for (i = 0; i < n; ++i) V[i] = r[i] / rn;
+        memset(g, 0, sizeof(double) * (size_t)(restart + 1));
+        memset(H, 0, sizeof(double) * (size_t)(restart + 1) * (size_t)restart);
+        g[0] = rn;
+        m = 0;
+        for (j = 0; j < restart && it < maxit; ++j, ++it) {
+            double hnext;
+            if (use_ilu) {
+                pvk2d_ilu_solve(c, V + (size_t)j * n, z);
+            } else {
+                memcpy(z, V + (size_t)j * n, sizeof(double) * (size_t)n);
+                pvk2d_jacobi_solve(c, z);
+            }
+            matvec(c, z, w);
+            memcpy(Z + (size_t)j * n, z, sizeof(double) * (size_t)n);
+            for (i = 0; i <= j; ++i) {
+                double h = dot(w, V + (size_t)i * n, n);
+                H[(size_t)i * restart + j] = h;
+                for (k = 0; k < n; ++k) w[k] -= h * V[(size_t)i * n + k];
+            }
+            hnext = norm2(w, n);
+            H[(size_t)(j + 1) * restart + j] = hnext;
+            /* 之前各步的 Givens 旋转消元 */
+            for (i = 0; i < j; ++i) {
+                double a = H[(size_t)i * restart + j];
+                double bb = H[(size_t)(i + 1) * restart + j];
+                H[(size_t)i * restart + j] = cs[i] * a + sn[i] * bb;
+                H[(size_t)(i + 1) * restart + j] = -sn[i] * a + cs[i] * bb;
+            }
+            {
+                double a = H[(size_t)j * restart + j];
+                double rr = hypot(a, hnext);
+                cs[j] = (rr > 1e-300) ? a / rr : 1.0;
+                sn[j] = (rr > 1e-300) ? hnext / rr : 0.0;
+                H[(size_t)j * restart + j] = rr;
+                H[(size_t)(j + 1) * restart + j] = 0.0;
+                g[j + 1] = -sn[j] * g[j];
+                g[j] = cs[j] * g[j];
+            }
+            m = j + 1;
+            if (fabs(g[j + 1]) / bn <= tol) break;
+            if (!(hnext > 1e-300)) break;
+            for (k = 0; k < n; ++k)
+                V[(size_t)(j + 1) * n + k] = w[k] / hnext;
+        }
+        /* 上三角回代 H(0:m,0:m) y = g */
+        for (i = m - 1; i >= 0; --i) {
+            double s = g[i];
+            for (k = i + 1; k < m; ++k)
+                s -= H[(size_t)i * restart + k] * y[k];
+            y[i] = (fabs(H[(size_t)i * restart + i]) > 1e-300)
+                       ? s / H[(size_t)i * restart + i] : 0.0;
+        }
+        for (i = 0; i < m; ++i) {
+            double yi = y[i];
+            for (k = 0; k < n; ++k) x[k] += yi * Z[(size_t)i * n + k];
+        }
+        if (m == 0) break;
+        /* 重启前重算真实残差 */
+        matvec(c, x, r);
+        for (i = 0; i < n; ++i) r[i] = b[i] - r[i];
+    }
+    if (ret < 0) {
+        double rn = norm2(r, n);
+        if (isfinite(rn) && rn / bn <= tol) ret = 0;
+    }
+done:
+    free(V); free(Z); free(H); free(cs); free(sn);
+    free(g); free(y); free(w); free(r); free(z);
+    return ret;
+}
+
+/* 线性方程组 A x = rhs 的真实相对残差（行缩放后） */
+static double pvk2d_lin_rel(pvk2d_ctx* c, const double* x) {
+    int i;
+    double num = 0.0, den = 0.0;
+    matvec(c, x, c->rbuf);
+    for (i = 0; i < c->n3; ++i) {
+        double d = c->rhs[i] - c->rbuf[i];
+        num += d * d;
+        den += c->rhs[i] * c->rhs[i];
+    }
+    return sqrt(num / fmax(den, 1e-300));
+}
+
+/* 稠密 LU（部分主元）：小规模 2D 系统的最后兜底。
+ * 近 Voc 时 Jacobian 极端病态，ILU 迭代法可能完全停滞后仍能靠直接解通过；
+ * 仅在 n3 ≤ PVK2D_DENSE_MAX 时启用，避免大网格 O(n³) 爆炸。 */
+#define PVK2D_DENSE_MAX 1800
+static int pvk2d_dense_lu(pvk2d_ctx* c, const double* b, double* x) {
+    int n = c->n3, i, j, k, piv;
+    double* A = NULL;
+    if (n > PVK2D_DENSE_MAX) return -1;
+    A = (double*)pvk2d_alloc(sizeof(double) * (size_t)n * (size_t)n);
+    if (!A) return -1;
+    for (i = 0; i < n; ++i) {
+        int p;
+        for (p = c->rowptr[i]; p < c->rowptr[i + 1]; ++p)
+            A[(size_t)i * n + c->col[p]] = c->val[p];
+    }
+    memcpy(x, b, sizeof(double) * (size_t)n);
+    for (k = 0; k < n; ++k) {
+        double mx = fabs(A[(size_t)k * n + k]);
+        double d;
+        piv = k;
+        for (i = k + 1; i < n; ++i) {
+            double v = fabs(A[(size_t)i * n + k]);
+            if (v > mx) { mx = v; piv = i; }
+        }
+        if (!(mx > 1e-300)) { free(A); return -1; }
+        if (piv != k) {
+            for (j = 0; j < n; ++j) {
+                double t = A[(size_t)k * n + j];
+                A[(size_t)k * n + j] = A[(size_t)piv * n + j];
+                A[(size_t)piv * n + j] = t;
+            }
+            { double t = x[k]; x[k] = x[piv]; x[piv] = t; }
+        }
+        d = A[(size_t)k * n + k];
+        for (i = k + 1; i < n; ++i) {
+            double m = A[(size_t)i * n + k] / d;
+            if (m == 0.0) continue;
+            A[(size_t)i * n + k] = 0.0;
+            for (j = k + 1; j < n; ++j)
+                A[(size_t)i * n + j] -= m * A[(size_t)k * n + j];
+            x[i] -= m * x[k];
+        }
+    }
+    for (i = n - 1; i >= 0; --i) {
+        double s = x[i];
+        for (j = i + 1; j < n; ++j) s -= A[(size_t)i * n + j] * x[j];
+        x[i] = s / A[(size_t)i * n + i];
+    }
+    free(A);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -820,6 +1010,7 @@ static int pvk2d_newton(pvk2d_ctx* c, double V, const double* G,
                         int maxit, double tol, double* res_out, int* it_out) {
     int N = c->N, it, i, r;
     int stagnant = 0;
+    int lin_ok = -1, approx = 0;
     pvk2d_apply_pins(c, V, psi, Yn, Zp);
     for (it = 0; it < maxit; ++it) {
         double base, lam, upd, upd_full, rt = INFINITY;
@@ -849,22 +1040,53 @@ static int pvk2d_newton(pvk2d_ctx* c, double V, const double* G,
             if (v > base) base = v;
         }
         pvk2d_ilu0(c);
-        if (pvk2d_bicgstab(c, c->rhs, c->du, 800, 1e-12) < 0) {
-            if (getenv("PVK2D_DEBUG")) {
-                int rr2; double num = 0.0, den = 0.0;
-                matvec(c, c->du, c->rbuf);
-                for (rr2 = 0; rr2 < c->n3; ++rr2) {
-                    double d = c->rhs[rr2] - c->rbuf[rr2];
-                    num += d * d; den += c->rhs[rr2] * c->rhs[rr2];
-                }
-                fprintf(stderr, "[pvk2d] bicgstab FAIL base=%.2e true_rel=%.2e\n",
-                        base, sqrt(num / fmax(den, 1e-300)));
+        lin_ok = pvk2d_bicgstab(c, c->rhs, c->du, 800, 1e-12, 0);
+        approx = 0;
+        if (lin_ok < 0) {
+            /* 停滞时先用当前残差作新影子残差重启一次 */
+            lin_ok = pvk2d_bicgstab(c, c->rhs, c->du, 800, 1e-12, 1);
+            if (getenv("PVK2D_DEBUG"))
+                fprintf(stderr, "[pvk2d] bicgstab restart -> %d (tr=%.2e)\n",
+                        lin_ok, pvk2d_lin_rel(c, c->du));
+        }
+        if (lin_ok < 0) {
+            /* 高偏压病态 Jacobian：ILU0-BiCGSTAB 会停滞（FG010 在 1.13 V
+             * 起 800 步只到 8.6e-4）。先看它的部分解是否已够用（非精确
+             * Newton，相对残差 ≤1e-2 就接受）；不够再退 GMRES(40)+ILU0、
+             * GMRES(40)+对角预条件；都不行就用 ILU 预条件方向。 */
+            double tr = pvk2d_lin_rel(c, c->du);
+            if (getenv("PVK2D_DEBUG"))
+                fprintf(stderr, "[pvk2d] bicgstab fail tr=%.2e, try GMRES\n", tr);
+            if (tr > 1e-2) {
+                lin_ok = pvk2d_gmres(c, c->rhs, c->du, 40, 600, 1e-10, 1);
+                if (lin_ok < 0)
+                    lin_ok = pvk2d_gmres(c, c->rhs, c->du, 40, 600, 1e-8, 0);
+                tr = pvk2d_lin_rel(c, c->du);
+                if (getenv("PVK2D_DEBUG"))
+                    fprintf(stderr, "[pvk2d] GMRES rel=%.2e\n", tr);
             }
-            *res_out = INFINITY; *it_out = it;
-            return 0;
+            if (lin_ok < 0 && tr > 1e-2) {
+                /* 小系统最后退直接解（n3 ≤ 1800），近 Voc 病态时最稳 */
+                lin_ok = pvk2d_dense_lu(c, c->rhs, c->du);
+                tr = pvk2d_lin_rel(c, c->du);
+                if (getenv("PVK2D_DEBUG"))
+                    fprintf(stderr, "[pvk2d] dense LU -> %d (rel=%.2e)\n",
+                            lin_ok, tr);
+            }
+            if (lin_ok < 0) {
+                if (tr <= 1e-2) {
+                    approx = 1;         /* 部分解作非精确 Newton 步 */
+                } else {
+                    pvk2d_ilu_solve(c, c->rhs, c->du);
+                    approx = 1;
+                }
+            }
+            if (getenv("PVK2D_DEBUG"))
+                fprintf(stderr, "[pvk2d] linear fallback: %s (base=%.2e)\n",
+                        approx ? "approx step" : "exact ok", base);
         }
         /* 迭代精化：病态系统下 ILU-BiCGSTAB 的残差不足以保证分量精度 */
-        {
+        if (!approx) {
             int ref;
             for (ref = 0; ref < 4; ++ref) {
                 double num = 0.0, den = 0.0;
@@ -875,7 +1097,7 @@ static int pvk2d_newton(pvk2d_ctx* c, double V, const double* G,
                     den += c->rhs[i] * c->rhs[i];
                 }
                 if (sqrt(num / fmax(den, 1e-300)) < 1e-13) break;
-                if (pvk2d_bicgstab(c, c->rbuf, c->du2, 400, 1e-13) < 0) break;
+                if (pvk2d_bicgstab(c, c->rbuf, c->du2, 400, 1e-13, 0) < 0) break;
                 for (i = 0; i < c->n3; ++i) c->du[i] += c->du2[i];
             }
             if (getenv("PVK2D_DEBUG")) {
@@ -1087,6 +1309,7 @@ int pvk2d_solve(pvk2d_ctx* c, double V, pvk2d_info* info) {
     int it = 0;
     double res = INFINITY;
     int ok;
+    double *sp = NULL, *sy = NULL, *sz = NULL;
     if (!c || !c->psi) return PVK_EAPI;
     if (!c->have_state) {
         int rc = pvk2d_compute_equilibrium(c);
@@ -1114,6 +1337,18 @@ int pvk2d_solve(pvk2d_ctx* c, double V, pvk2d_info* info) {
             }
         }
     }
+    /* 失败回滚：记录本次求解前的状态，所有尝试都失败时恢复，
+     * 避免坏解污染后续偏压（与 Python fv2d.solve_iv 的暖启动回滚同口径）。 */
+    sp = (double*)pvk2d_alloc(sizeof(double) * (size_t)c->N);
+    sy = (double*)pvk2d_alloc(sizeof(double) * (size_t)c->N);
+    sz = (double*)pvk2d_alloc(sizeof(double) * (size_t)c->N);
+    if (!sp || !sy || !sz) {
+        free(sp); free(sy); free(sz);
+        return PVK_EMEM;
+    }
+    memcpy(sp, c->psi, sizeof(double) * (size_t)c->N);
+    memcpy(sy, c->Yn, sizeof(double) * (size_t)c->N);
+    memcpy(sz, c->Zp, sizeof(double) * (size_t)c->N);
     ok = pvk2d_newton(c, V, c->G, c->psi, c->Yn, c->Zp, 80, 1e-9, &res, &it);
     if (!ok && from_eq && c->G) {
         /* 光强 ramp 回退（与 Python fv2d.solve 同一序列）：从平衡态按
@@ -1139,6 +1374,13 @@ int pvk2d_solve(pvk2d_ctx* c, double V, pvk2d_info* info) {
         c->need_seed = 0;
         ok = ramp_ok;
     }
+    if (!ok) {
+        /* 回滚到本次求解前的状态（失败点不污染后续偏压） */
+        memcpy(c->psi, sp, sizeof(double) * (size_t)c->N);
+        memcpy(c->Yn, sy, sizeof(double) * (size_t)c->N);
+        memcpy(c->Zp, sz, sizeof(double) * (size_t)c->N);
+    }
+    free(sp); free(sy); free(sz);
     if (info) {
         info->n_node = c->N;
         info->J_mA_cm2 = ok ? pvk2d_current(c) * 1e3 : 0.0;
