@@ -6,7 +6,7 @@
  *      乘 bin 宽度得到该 bin 的光子数 (cm⁻² s⁻¹)，再乘 intensity/100。
  *   2) 吸收系数用带隙唯象模型：α(λ) = A·sqrt(E - Eg)，E > Eg；
  *      其中 A = 2e5 cm⁻¹·eV^-0.5（MAPbI3 在 Eg+0.25 eV 处约 1e5 cm⁻¹）。
- *      只有 is_gen && !is_contact 的层吸收，带隙掩模由此自动生效。
+ *      只有 is_gen 的层吸收，带隙掩模由此自动生效。
  *   3) Beer-Lambert：τ(x) = ∫₀ˣ α dx'，正向 G = Φ·α·exp(-τ)。
  *   4) bounces > 1 时叠加一次背反射（反射率 R），
  *      G += Φ·α·R·exp(-(2τ_tot - τ(x)))。bounces 的具体次数不影响
@@ -36,7 +36,7 @@
  *     - 由背面波幅向前递推界面处的 A/B，再用空气侧入射波幅=1 定标，
  *       得到 R、T 与内部场 E(x)；
  *     - 吸收密度 q(x)=n·k·|E(x)|²，按 ∫q dx 归一化后乘 A(λ)=1-R(-T)；
- *     - 只有 is_gen && !is_contact 的层得到产生率；bandgap.mask 打开时
+ *     - 只有 is_gen 的层得到产生率；bandgap.mask 打开时
  *       E ≤ Eg 的层同样不产生载流子（这部分吸收按热损耗处理）。
  *   默认关闭，非相干路径逐位不变。
  *
@@ -199,7 +199,7 @@ static int nk_lookup_n_clamped(const pvk_nk* t, double lam_nm, double* n_out) {
 static double alpha_phenom(const pvk_device* dev, int li, double E_eV) {
     if (li < 0 || li >= dev->n_layers) return 0.0;
     const pvk_layer* L = &dev->layers[li];
-    if (!L->is_gen || L->is_contact || L->thick_nm <= 0.0) return 0.0;
+    if (!L->is_gen || L->thick_nm <= 0.0) return 0.0;
     if (L->Eg_eV <= 0.0 || E_eV <= L->Eg_eV) return 0.0;
     return PVK_ALPHA0 * sqrt(E_eV - L->Eg_eV);
 }
@@ -249,7 +249,7 @@ static double cx_abs2(pvk_cplx a) { return a.re * a.re + a.im * a.im; }
  *   - 尾部接触层（is_contact 且无 nk，如 Au）不参与传播，其界面用
  *     完美背镜 E=0 代替；若所有层都有 nk，则背边界为空气（透射出去）；
  *   - 吸收密度 q(x) = n·k·|E(x)|²，按 ∫q dx 归一化后乘吸收率 A(λ)；
- *   - 只有 is_gen && !is_contact 的层得到产生率；bandgap.mask 打开时
+ *   - 只有 is_gen 的层得到产生率；bandgap.mask 打开时
  *     E ≤ Eg 的层同样不产生载流子（这些光子被当作热损耗，不计入 A）。
  *
  * 返回 A(λ)（含金属/亚带隙吸收）。 */
@@ -369,7 +369,7 @@ static double coherent_one(const pvk_ctx* ctx, const pvk_device* dev,
         int li = ctx->mesh.node_layer[i];
         if (li < 0 || li >= m) continue;
         const pvk_layer* L = &dev->layers[li];
-        if (!L->is_gen || L->is_contact) continue;
+        if (!L->is_gen) continue;
         if (bg_mask && L->Eg_eV > 0.0 && E_ph <= L->Eg_eV) continue;
         g_field[i] += phi * fac * qbuf[i];
     }
@@ -383,7 +383,7 @@ static double alpha_of(const pvk_device* dev, int li, double E_eV,
                        double lam_nm, const pvk_nk* nk_table, int bg_mask) {
     if (li < 0 || li >= dev->n_layers) return 0.0;
     const pvk_layer* L = &dev->layers[li];
-    if (!L->is_gen || L->is_contact || L->thick_nm <= 0.0) return 0.0;
+    if (!L->is_gen || L->thick_nm <= 0.0) return 0.0;
 
     double k_val;
     if (nk_lookup(nk_table, lam_nm, NULL, &k_val)) {
@@ -521,7 +521,7 @@ PVK_API int pvk_optics_compute(pvk_ctx* ctx,
          * Atlas 的 BEAM 是非相干光线追踪：不扣前表面/界面菲涅尔，也不做
          * 背反射。这里按 A(λ)=1-exp(-Σαd)、G=φ·α·exp(-τ) 逐节点累积，
          * 吸收率含所有有 nk 的层（含 FTO 接触层，Atlas 的 A_all 同样算它），
-         * 产生率仍只给 is_gen && !is_contact 的层。仅用于逐点核对
+         * 产生率仍只给 is_gen 的层。仅用于逐点核对
          * Atlas 光线表的 A(λ)，不是物理模型；默认关闭。 */
         if (opt->atlas_ray != 0 && nks && nk_layers > 0) {
             const double PI = 3.14159265358979323846;
@@ -532,11 +532,12 @@ PVK_API int pvk_optics_compute(pvk_ctx* ctx,
                     double nn = 0.0, kk = 0.0;
                     if (nk_lookup_clamped(&nks[li], lam, &nn, &kk) && kk > 0.0) {
                         const pvk_layer* L = &dev->layers[li];
-                        int masked = opt->bandgap_mask && L->is_gen && !L->is_contact
+                        int masked = opt->bandgap_mask && L->is_gen
                                      && L->Eg_eV > 0.0 && E <= L->Eg_eV;
-                        /* 尾部接触层（is_contact 且非首层，如 Au）：Atlas 的光线表
-                         * 到 NiO 入口为止，金属区的吸收不计入 A_all，故该层 α=0。 */
-                        int metal = L->is_contact && li > 0;
+                        /* 电极层（is_gen=0 的接触层，如 Au）：Atlas 的光线表
+                         * 到 NiO 入口为止，金属区的吸收不计入 A_all，故该层 α=0。
+                         * 半导体接触层（is_gen=1，如裸 p-n 结的 Si）照常吸收。 */
+                        int metal = !L->is_gen && L->is_contact && li > 0;
                         if (!masked && !metal) {
                             a = 4.0 * PI * kk / (lam * 1e-7);
                         }
@@ -554,7 +555,7 @@ PVK_API int pvk_optics_compute(pvk_ctx* ctx,
                 int li = ctx->mesh.node_layer[i];
                 if (li < 0 || li >= dev->n_layers) continue;
                 const pvk_layer* L = &dev->layers[li];
-                if (!L->is_gen || L->is_contact) continue;
+                if (!L->is_gen) continue;
                 g_field[i] += phi * alpha[i] * exp(-tau[i]);
             }
             if (out_absorb_spectrum) {
